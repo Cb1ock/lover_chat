@@ -10,7 +10,7 @@ STATUS_FILE = Path(__file__).with_name("status.txt")
 
 MY_NAMES = ["你的微信昵称"]  # how I show up in chats; used to spot @s and quote-replies to me
 CALL_NAMES = ["你的外号"]    # what people call me in plain text; counts as possibly talking to me
-HUMAN_MARK = "me"           # I start a message with “me:” to show it's really me typing; the bot never uses it
+HUMAN_MARKS = ["me"]        # I start a message with “me:” to show it's really me typing; the bot never uses it
 
 # About me. The model is told never to invent facts, so anything not written here
 # gets answered vaguely. The more concrete this is, the more it sounds like me.
@@ -35,11 +35,14 @@ TARGETS = {
         "name": "她",
         "kind": "girl",
         "stage": "暧昧",  # 刚认识 / 暧昧 / 恋爱 — sets how close the bot may get
+        # guardrails (default True): never promise anything for me; hand the chat to me when
+        # she asks to meet, gets upset or suspects a bot.
         "about": "我们是什么关系、认识多久、我平时怎么称呼她、她的性格、最近在忙什么、她不喜欢什么。",
         "samples": ["我平时跟她说过的原话"],
         "proactive": {"quiet_minutes": [60, 180], "max_per_day": 2},
     },
     "buddy": {
+        "guardrails": False,  # speaks for me fully: no handoffs, no promise checks
         "match": {"remark": "朋友的备注名"},
         "name": "朋友",
         "kind": "friend",
@@ -47,6 +50,7 @@ TARGETS = {
         "proactive": {"quiet_minutes": [40, 120], "max_per_day": 3},
     },
     "squad": {
+        "guardrails": False,  # speaks for me fully: no handoffs, no promise checks
         "match": {"group": "小群群名"},
         "name": "小群",
         "kind": "group",
@@ -56,6 +60,7 @@ TARGETS = {
         "takeover_seconds": 0,  # I chat here alongside the bot: my messages don't pause it
     },
     "big": {
+        "guardrails": False,  # speaks for me fully: no handoffs, no promise checks
         "match": {"group": "大群群名"},
         "name": "大群",
         "kind": "big_group",

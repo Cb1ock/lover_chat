@@ -12,16 +12,11 @@ SYSTEM = """\
 你在微信上替“我”回消息。对方以为一直是我本人在打字，所以你就是我：用第一人称，绝不能暴露自己是 AI 或者在替别人回。
 
 ## 最高优先级规矩（比“像我”更重要）
-- 不做任何承诺或安排：不说“带你去吃”“明天陪你”“给你买”“去接你”“周末出来”这类话，也不答应对方提的；需要表态就说“我看看”“回头说”
-- 不编事实：聊天记录和下面资料里没有的事（我在哪、在干嘛、今天经历了什么、以前发生过什么），一律含糊带过
+{commit_rule}- 不编事实：聊天记录和下面资料里没有的事（我在哪、在干嘛、今天经历了什么、以前发生过什么），一律含糊带过
 {ai_rule}
 - 注意记录里每件事是谁说的、谁做的，别张冠李戴：标着“我”的话就是我自己说的、我自己的事
 - 不替我承认或否认关于我自己的事（身材、收入、经历、我说过的话是真是假），别说“瞎编的”“确实是真的”；被夸或被调侃就轻松接一句（“哈哈”“过奖”“还行吧”），不下结论
-- 遇到下面这些情况，只输出一行“[HANDOFF] 原因”，不要回复内容：
-  {doubt_handoff}对方情绪很差、生气、要吵架（撒娇式的试探不算，比如“你是不是不想理我”，要正常回）；涉及钱、健康、安全；
-  对方要我接电话、开视频，或者约具体的见面；
-  你拿不准该怎么回
-- 对话已经明显结束（晚安、拜拜、对方说去忙了），只输出 [SKIP]；对方只回“嗯嗯”“哈哈”时，可以 [SKIP]，也可以换个新话题（别追问刚才那个）
+{handoff_rule}- 对话已经明显结束（晚安、拜拜、对方说去忙了），只输出 [SKIP]；对方只回“嗯嗯”“哈哈”时，可以 [SKIP]，也可以换个新话题（别追问刚才那个）
 
 ## 我是谁
 {me}
@@ -155,6 +150,25 @@ KIND_RULES = {
 - 引用回复的格式是：引号里“某人: 原话”，一行“- - -”分隔线，下面才是这次新说的话；引的是我的话，就是在跟我说""",
 }
 
+# The "fences": no promises on my behalf, and hand the chat to me when it gets serious.
+# A target with "guardrails": False drops them and lets the bot speak for me fully.
+COMMIT_RULE = (
+    "- 不做任何承诺或安排：不说“带你去吃”“明天陪你”“给你买”“去接你”“周末出来”这类话，"
+    "也不答应对方提的；需要表态就说“我看看”“回头说”\n"
+)
+HANDOFF_RULE = """\
+- 遇到下面这些情况，只输出一行“[HANDOFF] 原因”，不要回复内容：
+  {doubt}对方情绪很差、生气、要吵架（撒娇式的试探不算，比如“你是不是不想理我”，要正常回）；涉及钱、健康、安全；
+  对方要我接电话、开视频，或者约具体的见面；
+  你拿不准该怎么回
+"""
+FREE_RULE = "- 什么情况都自己接住，不用交给我；想岔开的话题就开个玩笑带过\n"
+GUARD_CHECKS = """\
+1. 这个场合本该由我本人处理吗？对方约见面、约饭、约时间，要打电话或视频，生气、吵架、情绪很差，涉及钱/健康/安全{doubt}。是 → handoff
+   （撒娇式的试探不算生气，要正常回：“你是不是不想理我”“你觉得我胖吗”“打字这么慢是不是在跟别人聊”）
+2. 回复里有没有承诺或安排？包括“我陪你”“带你去”“安排上”“明天…”“给你买”“我来接你”，哪怕是随口一说。有 → rewrite"""
+FREE_CHECKS = "1~2. 这个对话由我全权代表，随口答应、开玩笑都可以，不用交给我，跳过这两项"
+
 AGENT_KNOWN_RULES = """\
 ## 这个群知道 agent 的事
 - 我自己在这个群说过最近在玩一个自动回复的 agent，所以有人试探“是不是 agent/AI 在回”“哪个模型”“这 AI 有点捞”很正常
@@ -202,9 +216,7 @@ REVIEW = """\
 {memory}
 
 按顺序检查：
-1. 这个场合本该由我本人处理吗？对方约见面、约饭、约时间，要打电话或视频，生气、吵架、情绪很差，涉及钱/健康/安全{doubt_check}。是 → handoff
-   （撒娇式的试探不算生气，要正常回：“你是不是不想理我”“你觉得我胖吗”“打字这么慢是不是在跟别人聊”）
-2. 回复里有没有承诺或安排？包括“我陪你”“带你去”“安排上”“明天…”“给你买”“我来接你”，哪怕是随口一说。有 → rewrite
+{guard_checks}
 3. 回复里有没有聊天记录和已知信息里都没有的事实？比如说我“刚醒”“在吃饭”“在路上”“在公司”（除非“我现在的状态”里写了）、说对方“第一次”做什么、“最近老念叨”什么、断言第三方怎么样；或者替我承认/否认关于我自己的事（“就是瞎编的”“确实是真的”“我没那么…”）；或者给对方的安排加上记录里没有的时间（她只说过在准备面试，回复却说“明天面试加油”），或者暗示一个记录里没有的习惯（“明天别太早叫我”）。有 → rewrite
 4. 都没有 → ok
 
@@ -218,7 +230,9 @@ REWRITE = """
 按规矩重写：不承诺、不编事实；或者只输出 [SKIP]。"""
 
 MAX_LINES = 3
-HUMAN_MARK_RE = re.compile(rf"^\s*{re.escape(config.HUMAN_MARK)}\s*[：:]\s*", re.I)
+HUMAN_MARK_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(m) for m in sorted(config.HUMAN_MARKS, key=len, reverse=True))
+    + r")\s*[：:]\s*", re.I)
 UNREADABLE_REVIEW = "审核结果看不懂，保险起见交给你"
 
 # Checked in code before the model runs: the model tends to talk its way through these
@@ -291,10 +305,13 @@ def system_prompt(target: dict) -> str:
     known = target.get("agent_known")
     if known:
         kind_rules += "\n\n" + AGENT_KNOWN_RULES
+    guarded = target.get("guardrails", True)
+    doubt = "" if known else "对方怀疑我是机器人/AI/不是本人，或者说我“怪怪的”“敷衍”“不像你”；\n  "
     return SYSTEM.format(
         ai_rule=("- 不主动提 agent、AI 这类话题；别人提起就按下面“这个群知道 agent 的事”处理" if known else
                  "- 绝不主动提 agent、AI、自动回复、机器人这类话题，哪怕之前聊过；别人提起就转开或输出 [SKIP]"),
-        doubt_handoff="" if known else "对方怀疑我是机器人/AI/不是本人，或者说我“怪怪的”“敷衍”“不像你”；\n  ",
+        commit_rule=COMMIT_RULE if guarded else "",
+        handoff_rule=HANDOFF_RULE.format(doubt=doubt) if guarded else FREE_RULE,
         me=config.ME.strip(),
         status=current_status(),
         memory=memory_text(target),
@@ -305,7 +322,7 @@ def system_prompt(target: dict) -> str:
 
 
 def transcript(history: list[dict]) -> str:
-    # My HUMAN_MARK prefix is never shown to the model, so it can't learn to imitate it.
+    # My HUMAN_MARKS prefixes are never shown to the model, so it can't learn to imitate it.
     return "\n".join(
         f"{time.strftime('%H:%M', time.localtime(h['time']))} {h['sender']}："
         f"{strip_human_mark(h['text']) if h['sender'] == '我' else h['text']}"
@@ -332,8 +349,9 @@ def opener_prompt(history: list[dict], quiet_minutes: int) -> str:
 
 
 def review_prompt(target: dict, history: list[dict], lines: list[str]) -> str:
+    doubt = "" if target.get("agent_known") else "，怀疑不是本人"
     return REVIEW.format(
-        doubt_check="" if target.get("agent_known") else "，怀疑不是本人",
+        guard_checks=GUARD_CHECKS.format(doubt=doubt) if target.get("guardrails", True) else FREE_CHECKS,
         lines=transcript(history), draft="\n".join(lines),
         me=config.ME.strip(), status=current_status(), about=target["about"],
         memory=memory_text(target),
@@ -430,7 +448,7 @@ def parse_reply(raw: str) -> Decision:
     lines = []
     for line in text.splitlines():
         # Drop a transcript-style "HH:MM 名字：" speaker label the model sometimes copies
-        # (a bare number like "12:" isn't a name), and above all my own HUMAN_MARK prefix.
+        # (a bare number like "12:" isn't a name), and above all my own HUMAN_MARKS prefixes.
         line = re.sub(r"^(\d{1,2}:\d{2}\s*)?(?!\d+[：:])[\w一-鿿·\- ]{1,10}[：:]\s*(?=\S)",
                       "", line.strip())
         line = strip_human_mark(line).strip("“”\"")

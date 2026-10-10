@@ -11,10 +11,11 @@ MAX_DRAFTS = 3
 def compose(target: dict, history: list[dict]) -> Decision:
     """Answer the latest messages."""
     known = target.get("agent_known", False)
-    doubt = None if known else prompts.suspicion(history)
+    guarded = target.get("guardrails", True)
+    doubt = prompts.suspicion(history) if guarded and not known else None
     if doubt:
         return Decision("handoff", reason=f"对方好像起疑了：「{doubt}」")
-    if target["kind"] == "girl":
+    if guarded and target["kind"] == "girl":
         hers = prompts.girl_handoff(history)
         if hers:
             return Decision("handoff", reason=f"她在约你或者不开心了：「{hers}」")
@@ -57,7 +58,7 @@ def _draft_and_review(target: dict, history: list[dict], user: str, *, ai_talk_o
         draft = prompts.parse_reply(llm.chat(system, ask))
         if draft.kind != "reply":
             return draft
-        promise = prompts.commitment(draft.lines)
+        promise = prompts.commitment(draft.lines) if target.get("guardrails", True) else None
         bot_talk = None if ai_talk_ok else prompts.ai_topic(draft.lines)
         tell = prompts.ai_tell(draft.lines)
         echo = prompts.parroted(draft.lines, history)

@@ -23,9 +23,12 @@ Notes for coding agents working on this repo. See README.md for what the project
 
 ## Invariants (don't break these)
 
-- **Never invent facts about the user or promise anything on their behalf.** Prompt rules alone
-  don't hold. Back them with code checks in `prompts.py` and the reviewer in `reply.py`.
-- **The bot must never use the user's `HUMAN_MARK` prefix.** It is stripped from the transcript
+- **Never invent facts about the user.** In chats with `guardrails` on (the default, meant for
+  her), also never promise anything on their behalf, and hand off when she asks to meet, gets upset,
+  or suspects a bot. `guardrails: False` (the user's guy friends) drops the promise checks and the
+  handoffs. Prompt rules alone don't hold: back them with code checks in `prompts.py` and the
+  reviewer in `reply.py`.
+- **The bot must never use the user's `HUMAN_MARKS` prefixes.** It is stripped from the transcript
   shown to the model (`transcript`) and from model output (`parse_reply`).
 - **Web WeChat replays recent messages after every login.** Dedupe against the whole history
   file (`Chat.seen_rows`, `REPLAY_SLACK_SECONDS`). Messages older than `started_at` are context

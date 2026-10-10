@@ -53,7 +53,8 @@ class Chat:
     history: list[dict] = field(default_factory=list)
     task: asyncio.Task | None = None
     sending: bool = False
-    dirty: bool = False  # a new message arrived while we were sending
+    instructing: bool = False  # carrying out my 文件传输助手 instruction: don't cancel it
+    dirty: bool = False  # a new message arrived while we were sending or instructing
     paused_until: float = 0.0
     # (is it me, text) -> times, over the whole history file: replays after login can
     # reach back further than the last HISTORY_TURNS messages.
@@ -301,15 +302,22 @@ async def on_filehelper(msg: dict) -> None:
 
 
 async def instructed_flow(chat: Chat, instruction: str) -> None:
-    await asyncio.sleep(random.uniform(2, 5))
-    if not chat.peer:
-        chat.peer = await page.evaluate("m => window.__lcFind(m)", chat.cfg["match"])
+    chat.instructing = True
     try:
-        decision = await asyncio.to_thread(reply.compose_instructed, cfg_for(chat), chat.history, instruction)
-    except Exception as e:  # noqa: BLE001 - keep the bot alive on any API failure
-        log(f"[{chat.key}] 模型调用失败：{e}")
-        return
-    await send_lines(chat, decision.lines)
+        await asyncio.sleep(random.uniform(2, 5))
+        if not chat.peer:
+            chat.peer = await page.evaluate("m => window.__lcFind(m)", chat.cfg["match"])
+        try:
+            decision = await asyncio.to_thread(reply.compose_instructed, cfg_for(chat), chat.history, instruction)
+        except Exception as e:  # noqa: BLE001 - keep the bot alive on any API failure
+            log(f"[{chat.key}] 模型调用失败：{e}")
+            return
+        await send_lines(chat, decision.lines)
+    finally:
+        chat.instructing = False
+        if chat.dirty:  # they wrote while I was being obeyed: answer that next
+            chat.dirty = False
+            schedule_reply(chat)
 
 
 async def reply_flow(chat: Chat) -> None:
@@ -319,7 +327,10 @@ async def reply_flow(chat: Chat) -> None:
     hour_ago = time.time() - 3600
     chat.sent_at = [t for t in chat.sent_at if t > hour_ago]
     if len(chat.sent_at) >= config.MAX_LINES_PER_HOUR:
-        await hand_off(chat, f"一小时内已自动回复 {len(chat.sent_at)} 条，先停一下")
+        if chat.cfg.get("guardrails", True):
+            await hand_off(chat, f"一小时内已自动回复 {len(chat.sent_at)} 条，先停一下")
+        else:
+            log(f"[{chat.key}] 一小时内已自动回复 {len(chat.sent_at)} 条，这条先不回")
         return
 
     try:
@@ -411,7 +422,7 @@ async def proactive_loop() -> None:
 
 
 def schedule_reply(chat: Chat) -> None:
-    if chat.sending:
+    if chat.sending or chat.instructing:
         chat.dirty = True
         return
     if chat.task and not chat.task.done():
