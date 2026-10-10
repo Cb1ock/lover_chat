@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+
+# Secrets and personal data: never commit
+.env
+config.py
+status.txt
+data/
+.wx_profile/
+
+# Runtime switches
+PAUSE
+RESUME
