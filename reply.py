@@ -53,9 +53,13 @@ def _draft_and_review(target: dict, history: list[dict], user: str, *, ai_talk_o
     system = prompts.system_prompt(target)
     ask = user
     reason = ""
+    guarded = target.get("guardrails", True)
     feedback: list[str] = []  # every rejected draft so far, so rewrites don't ping-pong
     for attempt in range(1, MAX_DRAFTS + 1):
         draft = prompts.parse_reply(llm.chat(system, ask))
+        if draft.kind == "handoff" and not guarded:
+            # No fences in this chat: the model getting cold feet just means staying quiet.
+            return Decision("skip", reason=f"模型不想接：{draft.reason}")
         if draft.kind != "reply":
             return draft
         promise = prompts.commitment(draft.lines) if target.get("guardrails", True) else None
@@ -78,7 +82,7 @@ def _draft_and_review(target: dict, history: list[dict], user: str, *, ai_talk_o
             verdict, reason = _review(target, history, draft.lines)
         if verdict == "ok":
             return draft
-        if verdict == "handoff":
+        if verdict == "handoff" and guarded:
             return Decision("handoff", reason=reason)
         feedback.append(prompts.rewrite_suffix(draft.lines, reason))
         ask = user + "".join(feedback)
