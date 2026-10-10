@@ -1,4 +1,4 @@
-"""Decide what to send: generate a draft, have it reviewed, rewrite or hand off."""
+"""Decide what to send: continue the chat as me, run the few hard checks, rewrite or hand off."""
 from __future__ import annotations
 
 import llm
@@ -19,13 +19,15 @@ def compose(target: dict, history: list[dict]) -> Decision:
         hers = prompts.girl_handoff(history)
         if hers:
             return Decision("handoff", reason=f"她在约你或者不开心了：「{hers}」")
-    return _draft_and_review(target, history, prompts.user_prompt(history), ai_talk_ok=known)
+    if fact := prompts.fact_question(history):
+        return Decision("ask", reason=f"{fact}（关于你本人的事，我不知道怎么答）")
+    return _draft(target, history)
 
 
 def compose_instructed(target: dict, history: list[dict], instruction: str) -> Decision:
     """Reply the way I said to in 文件传输助手. My word overrides every check."""
-    draft = prompts.parse_reply(llm.chat(prompts.system_prompt(target),
-                                         prompts.instructed_prompt(history, instruction)))
+    draft = prompts.parse_reply(llm.chat_messages(
+        prompts.chat_messages(target, history, prompts.instructed_tail(instruction))))
     if draft.kind == "reply":
         return draft
     return Decision("reply", lines=[instruction])  # model balked: send my words as-is
@@ -33,7 +35,47 @@ def compose_instructed(target: dict, history: list[dict], instruction: str) -> D
 
 def compose_opener(target: dict, history: list[dict], quiet_minutes: int) -> Decision:
     """Start a new topic in a chat that has gone quiet."""
-    return _draft_and_review(target, history, prompts.opener_prompt(history, quiet_minutes))
+    return _draft(target, history, prompts.opener_tail(quiet_minutes))
+
+
+def _draft(target: dict, history: list[dict], tail: str = "") -> Decision:
+    guarded = target.get("guardrails", True)
+    known = target.get("agent_known", False)
+    feedback = ""
+    reason = ""
+    for attempt in range(1, MAX_DRAFTS + 1):
+        note = "\n\n".join(x for x in (tail, feedback) if x)
+        draft = prompts.parse_reply(llm.chat_messages(prompts.chat_messages(target, history, note)))
+        if draft.kind == "handoff" and not guarded:
+            # No fences in this chat: the model getting cold feet just means staying quiet.
+            return Decision("skip", reason=f"模型不想接：{draft.reason}")
+        if draft.kind == "ask" and prompts.ASK_NOT_A_FACT.search(draft.reason):
+            return Decision("skip", reason=f"模型拿不准怎么回：{draft.reason}")
+        if draft.kind != "reply":
+            return draft
+
+        problem = None
+        if echo := prompts.parroted(draft.lines, history):
+            problem = f"“{echo}”是在复读对方的话"
+        elif not known and (bot_talk := prompts.ai_topic(draft.lines)):
+            problem = f"提到了“{bot_talk}”，别聊 AI/机器人这类话题"
+        elif tell := prompts.ai_tell(draft.lines):
+            problem = f"“{tell}”太像 AI 了"
+        elif guarded and (promise := prompts.commitment(draft.lines)):
+            problem = f"“{promise}”是在替我承诺或安排"
+        if problem is None and guarded:
+            # The reviewer is slow and cautious: only for chats that keep the fences (hers).
+            verdict, reason = _review(target, history, draft.lines)
+            if verdict == "ok":
+                return draft
+            if verdict == "handoff":
+                return Decision("handoff", reason=reason)
+            problem = reason
+        if problem is None:
+            return draft
+        reason = problem
+        feedback = prompts.rewrite_tail(draft.lines, problem)
+    return Decision("skip", reason=f"改了 {MAX_DRAFTS} 次还是不合适，这次不回：{reason}")
 
 
 def _review(target: dict, history: list[dict], lines: list[str]) -> tuple[str, str]:
@@ -46,45 +88,3 @@ def _review(target: dict, history: list[dict], lines: list[str]) -> tuple[str, s
         if reason != prompts.UNREADABLE_REVIEW:
             return verdict, reason
     return verdict, reason
-
-
-def _draft_and_review(target: dict, history: list[dict], user: str, *, ai_talk_ok: bool = False) -> Decision:
-    """ai_talk_ok: replying in a chat that knows about the agent, so teasing about it is fine."""
-    system = prompts.system_prompt(target)
-    ask = user
-    reason = ""
-    guarded = target.get("guardrails", True)
-    feedback: list[str] = []  # every rejected draft so far, so rewrites don't ping-pong
-    for attempt in range(1, MAX_DRAFTS + 1):
-        draft = prompts.parse_reply(llm.chat(system, ask))
-        if draft.kind == "handoff" and not guarded:
-            # No fences in this chat: the model getting cold feet just means staying quiet.
-            return Decision("skip", reason=f"模型不想接：{draft.reason}")
-        if draft.kind != "reply":
-            return draft
-        promise = prompts.commitment(draft.lines) if target.get("guardrails", True) else None
-        bot_talk = None if ai_talk_ok else prompts.ai_topic(draft.lines)
-        tell = prompts.ai_tell(draft.lines)
-        echo = prompts.parroted(draft.lines, history)
-        # Repetition is a style nit: on the last try, a repeated word beats saying nothing.
-        repeat = prompts.repeated_phrase(draft.lines, history) if attempt < MAX_DRAFTS else None
-        if echo:
-            verdict, reason = "rewrite", f"“{echo}”是在复读对方的话，用我自己的话回"
-        elif promise:
-            verdict, reason = "rewrite", f"“{promise}”是在替我承诺或安排"
-        elif bot_talk:
-            verdict, reason = "rewrite", f"提到了“{bot_talk}”：不许聊 AI/机器人/自动回复，换个别的话题"
-        elif tell:
-            verdict, reason = "rewrite", f"“{tell}”AI 味太重，像真人一样随口说"
-        elif repeat:
-            verdict, reason = "rewrite", f"“{repeat}”我前面刚说过，别重复这个梗，换个说法或换个角度"
-        else:
-            verdict, reason = _review(target, history, draft.lines)
-        if verdict == "ok":
-            return draft
-        if verdict == "handoff" and guarded:
-            return Decision("handoff", reason=reason)
-        feedback.append(prompts.rewrite_suffix(draft.lines, reason))
-        ask = user + "".join(feedback)
-    # Only the reviewer's "handoff" needs me; failing style checks just means stay quiet.
-    return Decision("skip", reason=f"改了 {MAX_DRAFTS} 次还是不合适，这次不回：{reason}")

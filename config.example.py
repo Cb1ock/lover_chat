@@ -11,6 +11,7 @@ STATUS_FILE = Path(__file__).with_name("status.txt")
 MY_NAMES = ["你的微信昵称"]  # how I show up in chats; used to spot @s and quote-replies to me
 CALL_NAMES = ["你的外号"]    # what people call me in plain text; counts as possibly talking to me
 HUMAN_MARKS = ["me"]        # I start a message with “me:” to show it's really me typing; the bot never uses it
+COLLECT_EXCLUDE = []  # chats never written to data/corpus (matched by name)
 
 # About me. The model is told never to invent facts, so anything not written here
 # gets answered vaguely. The more concrete this is, the more it sounds like me.
@@ -29,6 +30,7 @@ MY_SAMPLES = [
 
 # kind: "girl" | "friend" | "group" | "big_group" picks the matching rules in prompts.py.
 # match: "remark" = the 备注名 of a friend; "group" = text contained in the group chat's name.
+# "enabled": False keeps a target in the file but stops watching it.
 TARGETS = {
     "her": {
         "match": {"remark": "她的备注名"},
@@ -76,7 +78,7 @@ TARGETS = {
 # at most max_per_day times, and only between these hours.
 ACTIVE_HOURS = (10, 23)
 
-READ_DELAY = (4, 10)            # seconds after their last message before replying; collects bursts
+READ_DELAY = (6, 15)            # seconds after their last message before replying; collects bursts
 HISTORY_TURNS = 40              # messages of context sent to the model
 HUMAN_TAKEOVER_SECONDS = 10 * 60  # I typed in a chat myself -> bot stays quiet there this long
                                   # (a target's "takeover_seconds" overrides it; 0 = never pause)

@@ -52,6 +52,34 @@ cp config.example.py config.py    # 填你的人设和要自动回复的对象
 
 第一次会弹出一个 Chrome 窗口，用手机扫码登录网页版微信，登录状态保存在 `.wx_profile/`。网页版同一时间只能登录一处。如果开着代理，wx2.qq.com 偶尔会连不上，程序会自动重试。
 
+## 聊天记录收集
+
+程序一直在后台收集你的聊天记录，用来学你的说话风格（`data/corpus/`，每个对话一个文件，不进仓库）：
+
+- 只收你说过话的对话：你的每条消息都记，别人的消息只在你回复时作为上下文记最近 10 条；只潜水的群不留痕迹
+- 每条标 `author`：`me`（你亲手发的，加没加暗号都算）、`ai`（程序发的）、`other`（别人）。程序认 AI 靠的是它自己发出的消息 ID（持久保存），不靠暗号
+- `COLLECT_EXCLUDE` 里的对话不收
+- 建一个 `PAUSE` 文件就是「只收集、不回复」模式
+
+回复时，程序会从这些记录里挑你真实的一来一回当示范（排除暗号消息和聊 agent 本身的内容），把聊天按一来一回的对话轮次交给模型，让它直接以你的身份接着聊。
+
+## 守护进程
+
+```bash
+./botctl.sh install    # 注册成 macOS 守护进程并启动：崩溃自动重启，登录后自动启动
+./botctl.sh stop       # 停止（不会被自动拉起）
+./botctl.sh start | restart | status | log
+./botctl.sh uninstall  # 停止并取消开机自启
+```
+
+和直接 `.venv/bin/python bot.py` 是同一个程序，区别只在于由 launchd 托管。两种方式别同时跑：网页版微信只能登录一处，会互相挤下线。
+
+## 表情包
+
+把 GIF 放进 `stickers/`，文件名就是表情包的名字（比如 `笑死.gif`），程序会把可用的名字告诉模型，模型在回复里单独一行写 `[表情包:笑死]` 就会发出去，对方收到的是真正的表情包。建议 240×240、500KB 以内。以 `_` 开头的文件只用于测试，模型看不到。启动时设 `LC_STICKER_TEST=名字` 会把那张表情包发到你的文件传输助手，用来检查发送是否正常。
+
+`stickers/` 不进仓库。作者自用的那套来自 Google 的 [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/)，授权 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)，已缩放并重新编码为 GIF。
+
 ## 测试提示词
 
 ```bash

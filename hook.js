@@ -93,6 +93,39 @@
       return {ok: msg.MMStatus === conf.MSG_SEND_STATUS_SUCC, id: String(msg.MsgId)};
     };
 
+    // Stickers: Python uploads the file (no CORS, real error messages) using what this
+    // returns, then __lcSendEmoticon posts the uploaded MediaId as a sticker (MsgType 47).
+    const util = inj.get('utilFactory');
+    const confUrl = (re, fallback) => {
+      for (const k in conf) if (typeof conf[k] === 'string' && re.test(conf[k])) return conf[k].split('?')[0];
+      return fallback;
+    };
+    window.__lcUploadInfo = () => ({
+      uploadUrl: confUrl(/webwxuploadmedia/, `https://file.${location.host}/cgi-bin/mmwebwx-bin/webwxuploadmedia`),
+      baseRequest: acc.getBaseRequest(), passTicket: acc.getPassticket() || '',
+      dataTicket: util.getCookie('webwx_data_ticket') || '', me: acc.getUserName(),
+    });
+    window.__lcSendEmoticon = async (peer, mediaId) => {
+      const sendUrl = confUrl(/webwxsendemoticon/, '/cgi-bin/mmwebwx-bin/webwxsendemoticon');
+      botSent.push({peer, text: '[表情]', at: Date.now()});
+      const localId = String(Date.now()) + String(Math.random()).slice(2, 6);
+      const body = {
+        BaseRequest: acc.getBaseRequest(), Scene: 0,
+        Msg: {Type: 47, EmojiFlag: 2, MediaId: mediaId, FromUserName: acc.getUserName(), ToUserName: peer,
+              LocalID: localId, ClientMsgId: localId},
+      };
+      let sent;
+      try {
+        sent = await fetch(`${sendUrl}?fun=sys&pass_ticket=${encodeURIComponent(acc.getPassticket() || '')}`, {
+          method: 'POST', body: JSON.stringify(body), credentials: 'include',
+          headers: {'Content-Type': 'application/json;charset=UTF-8'},
+        }).then(r => r.json());
+      } catch (e) { return {ok: false, step: 'send', detail: `${sendUrl}: ${e}`}; }
+      const ok = !!(sent && sent.BaseResponse && sent.BaseResponse.Ret === 0);
+      if (ok && sent.MsgID) forwarded.add(String(sent.MsgID));
+      return {ok, id: String((sent && sent.MsgID) || ''), step: 'send', detail: ok ? null : sent};
+    };
+
     // Look up a chat's UserName by 备注名 (friend) or group-name substring, for chats
     // that haven't had any traffic yet in this login.
     window.__lcFind = (match) => {

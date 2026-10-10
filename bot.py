@@ -10,17 +10,24 @@ file named RESUME to end that early.
 from __future__ import annotations
 
 import asyncio
+import collections
+import hashlib
 import json
+import os
 import random
 import re
+import signal
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from playwright.async_api import Page, async_playwright
+import httpx
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 import config
 import memory
+import prompts
 import reply
 
 ROOT = Path(__file__).parent
@@ -32,6 +39,13 @@ CATCH_UP_SECONDS = 30 * 60  # after login/RESUME, answer a chat whose last messa
 REPLAY_SLACK_SECONDS = 30  # our own sends are logged with local time, the replay with server time
 ENGAGED_SECONDS = 600  # in mention-only groups, messages this soon after I spoke go to the model
 ASK_WAIT_SECONDS = 10 * 60  # after asking me something in 文件传输助手, wait this long for my answer
+MIN_REPLY_GAP_SECONDS = 20  # at least this long between two auto replies in the same chat
+# Every chat web WeChat sees, one file per chat, each line labelled me / ai / other.
+# AI is told apart by the message ids the bot itself sent (persisted, so replays after a
+# restart are still recognised), never by my HUMAN_MARKS prefix.
+CORPUS_DIR = DATA_DIR / "corpus"
+BOT_SENT_FILE = CORPUS_DIR / "_bot_sent_ids.txt"
+CORPUS_CONTEXT = 10  # how many of their latest messages are kept as context for my next reply
 RESUMED_AT_FILE = DATA_DIR / "resumed_at"  # a RESUME outlives restarts
 OPENER_RETRY_SECONDS = 30 * 60  # after an opener attempt (sent or skipped), wait this long
 # 文件传输助手 is my control channel: the bot posts handoff notes there, and what I type
@@ -76,12 +90,18 @@ class Chat:
 
 
 page: Page
+ctx: BrowserContext
 chats: dict[str, Chat] = {}
 seen_ids: set[str] = set()
 started_at = time.time()
 logged_in = False
 filehelper_rows: list[dict] = []  # my notes and instructions in 文件传输助手
 done_instructions: set[str] = set()
+bot_sent_ids: set[str] = set()  # ids of every message the bot sent, across restarts
+bot_texts: dict[str, list[int]] = {}  # text -> times, from history rows the bot sent (auto)
+corpus_ids: dict[Path, set[str]] = {}  # per corpus file: ids already written
+corpus_context: dict[Path, collections.deque] = {}  # per corpus file: their unwritten recent messages
+peer_names: dict[str, tuple[str, bool]] = {}  # UserName -> (chat name, is group), learned from traffic
 
 
 def log(text: str) -> None:
@@ -141,6 +161,102 @@ def log_filehelper(text: str, ts: float) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def corpus_path(name: str) -> Path:
+    return CORPUS_DIR / (re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_") + ".jsonl")
+
+
+def corpus_write(name: str, is_group: bool, row: dict) -> None:
+    """Log a row. Other people's messages wait in memory and are only written, as context,
+    once I (or the bot as me) reply in that chat: chats I never speak in leave no trace."""
+    path = corpus_path(name or "unknown")
+    if path not in corpus_ids:
+        corpus_ids[path] = ({json.loads(l)["id"] for l in path.read_text(encoding="utf-8").splitlines() if l.strip()}
+                            if path.exists() else set())
+    if row["id"] in corpus_ids[path]:
+        return  # replayed after login, or the echo of a send already logged
+    if row["author"] == "other":
+        corpus_context.setdefault(path, collections.deque(maxlen=CORPUS_CONTEXT)).append(row)
+        return
+    rows = [r for r in corpus_context.pop(path, []) if r["id"] not in corpus_ids[path]] + [row]
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
+            corpus_ids[path].add(r["id"])
+            f.write(json.dumps({"chat": name, "group": is_group, **r}, ensure_ascii=False) + "\n")
+
+
+def collect(msg: dict) -> None:
+    """Log any message from any chat. Mine are "me" unless the bot sent them."""
+    name = msg["peerRemark"] or msg["peerNick"]
+    if msg["peer"] == FILEHELPER:
+        name = "文件传输助手"
+    if name:
+        peer_names[msg["peer"]] = (name, msg["isGroup"])
+        adopt_unnamed(msg["peer"], name)
+    else:
+        # A group web WeChat hasn't loaded yet: file it under its UserName for now and
+        # merge it into the named file once a later message carries the name.
+        name = peer_names.get(msg["peer"], (msg["peer"], msg["isGroup"]))[0]
+    if any(x in name for x in getattr(config, "COLLECT_EXCLUDE", [])):
+        return
+    author = "other"
+    if msg["fromMe"]:
+        author = "ai" if sent_by_bot(msg) else "me"
+    corpus_write(name, msg["isGroup"], {
+        "id": msg["id"], "time": int(msg["time"]), "sender": msg["sender"], "author": author,
+        "marked": author == "me" and bool(prompts.HUMAN_MARK_RE.match(msg["text"])),
+        "type": msg["type"], "text": msg["text"],
+    })
+
+
+def sent_by_bot(msg: dict) -> bool:
+    """By id when the collector saw the send; else by the bot's own records (history rows
+    marked auto, my 文件传输助手 notes), for messages sent before the collector existed."""
+    if msg["id"] in bot_sent_ids or msg["text"].startswith(NOTE_PREFIX):
+        return True
+    return any(abs(t - msg["time"]) <= 60 for t in bot_texts.get(msg["text"], ()))
+
+
+def load_bot_texts() -> None:
+    for path in [*DATA_DIR.glob("history_*.jsonl"), *DATA_DIR.glob("archive/*/history_*.jsonl")]:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line) if line.strip() else {}
+            if row.get("auto"):
+                bot_texts.setdefault(row["text"], []).append(row["time"])
+
+
+def adopt_unnamed(peer: str, name: str) -> None:
+    """Fold what was logged under a chat's UserName (name unknown back then) into its named file."""
+    unnamed, named = corpus_path(peer), corpus_path(name)
+    if unnamed == named:
+        return
+    if unnamed in corpus_context:
+        corpus_context.setdefault(named, collections.deque(maxlen=CORPUS_CONTEXT)).extend(corpus_context.pop(unnamed))
+    if not unnamed.exists():
+        return
+    for line in unnamed.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            row.pop("chat", None)
+            is_group = row.pop("group", peer.startswith("@@"))
+            corpus_write(name, is_group, row)
+    unnamed.unlink()
+    corpus_ids.pop(unnamed, None)
+
+
+def collect_sent(peer: str, fallback_name: str, text: str, msg_id: str) -> None:
+    """The bot just sent something: remember its id and log it as "ai"."""
+    if not msg_id:
+        return
+    bot_sent_ids.add(msg_id)
+    with BOT_SENT_FILE.open("a", encoding="utf-8") as f:
+        f.write(msg_id + "\n")
+    name, is_group = peer_names.get(peer, (fallback_name, peer.startswith("@@")))
+    if any(x in name for x in getattr(config, "COLLECT_EXCLUDE", [])):
+        return
+    corpus_write(name, is_group, {"id": msg_id, "time": int(time.time()), "sender": "我", "author": "ai",
+                                  "marked": False, "type": 1, "text": text})
+
+
 def resumed_at() -> float:
     """When I last created RESUME; anything before it, I've already seen."""
     return float(RESUMED_AT_FILE.read_text()) if RESUMED_AT_FILE.exists() else 0.0
@@ -160,8 +276,9 @@ def record(chat: Chat, sender: str, text: str, ts: float, *,
 
 
 def cfg_for(chat: Chat) -> dict:
-    """The chat's config plus its long-term memory, as the prompts expect it."""
-    return {**chat.cfg, "memory": memory.load(chat.key)["facts"]}
+    """The chat's config plus its long-term memory and my real exchanges, as the prompts expect it."""
+    return {**chat.cfg, "memory": memory.load(chat.key)["facts"],
+            "examples": prompts.real_examples(chat.key, chat.cfg["kind"])}
 
 
 def remember(chat: Chat) -> None:
@@ -235,11 +352,20 @@ def catch_up() -> None:
 
 async def catch_up_after_login() -> None:
     await asyncio.sleep(5)  # let the post-login replay land first
+    if not logged_in:
+        return  # dropped again in the meantime; the next login runs this anew
     for chat in chats.values():
         if not chat.peer:  # no replayed traffic for this chat: look it up in the contact list
-            chat.peer = await page.evaluate("m => window.__lcFind(m)", chat.cfg["match"])
+            chat.peer = await find_peer(chat)
         remember(chat)
     catch_up()
+
+
+async def find_peer(chat: Chat) -> str:
+    try:
+        return await page.evaluate("m => window.__lcFind ? window.__lcFind(m) : ''", chat.cfg["match"])
+    except Exception:  # noqa: BLE001 - page reloading or logged out
+        return ""
 
 
 def resume_all() -> None:
@@ -260,6 +386,60 @@ async def send(peer: str, text: str) -> dict:
     return await page.evaluate("([p, t]) => window.__lcSend(p, t)", [peer, text])
 
 
+async def upload_media(path: Path, peer: str) -> str:
+    """Upload a file to web WeChat's media server the way the web client does; return MediaId."""
+    info = await page.evaluate("() => window.__lcUploadInfo()")
+    data = path.read_bytes()
+    mime = prompts.STICKER_TYPES[path.suffix.lower()]
+    # Mirrors the web client's own uploader. UploadType must be 1: with 2 the server
+    # accepts the request and then never answers.
+    request = {
+        **info["baseRequest"], "UploadType": 1, "ClientMediaId": int(time.time() * 1000),
+        "TotalLen": len(data), "StartPos": 0, "DataLen": len(data), "MediaType": 4,
+        "FromUserName": info["me"], "ToUserName": peer, "FileMd5": hashlib.md5(data).hexdigest(),
+    }
+    form = {
+        "id": "WU_FILE_0", "name": path.name, "type": mime,
+        "lastModifiedDate": time.strftime("%a %b %d %Y %H:%M:%S GMT+0800 (CST)"),
+        "size": str(len(data)), "mediatype": "pic",
+        "uploadmediarequest": json.dumps(request, separators=(",", ":")),
+        "webwx_data_ticket": info["dataTicket"], "pass_ticket": urllib.parse.unquote(info["passTicket"]),
+    }
+    url = info["uploadUrl"]
+    cookies = await ctx.cookies([url])
+    headers = {
+        "Cookie": "; ".join(f"{c['name']}={c['value']}" for c in cookies),
+        "Origin": "https://wx2.qq.com", "Referer": "https://wx2.qq.com/",
+        "User-Agent": await page.evaluate("() => navigator.userAgent"),
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url + "?f=json", data=form, files={"filename": (path.name, data, mime)},
+                              headers=headers)
+    try:
+        media_id = r.json().get("MediaId")
+    except ValueError:
+        media_id = None
+    if not media_id:
+        raise RuntimeError(f"{url} HTTP {r.status_code}: {r.text[:200]}")
+    return media_id
+
+
+async def send_sticker(peer: str, path: Path) -> dict:
+    try:
+        media_id = await upload_media(path, peer)
+    except Exception as e:  # noqa: BLE001 - report, don't crash
+        return {"ok": False, "step": "upload", "detail": repr(e)[:300]}
+    return await page.evaluate("([p, m]) => window.__lcSendEmoticon(p, m)", [peer, media_id])
+
+
+async def send_line(chat: Chat, line: str) -> dict:
+    """Send one line of a reply: a [表情包:名字] line becomes a sticker, the rest text."""
+    m = prompts.STICKER_LINE.match(line)
+    if m and (path := prompts.stickers().get(m.group(1))):
+        return await send_sticker(chat.peer, path)
+    return await send(chat.peer, line)
+
+
 async def hand_off(chat: Chat, reason: str) -> None:
     chat.paused_until = time.time() + config.HANDOFF_PAUSE_SECONDS
     save_pauses()
@@ -268,7 +448,8 @@ async def hand_off(chat: Chat, reason: str) -> None:
             f"直接在这里告诉我怎么回，我照着回")
     log(f"[{chat.key}] 转交给你：{reason}")
     log_filehelper(note, time.time())
-    await send(FILEHELPER, note)
+    res = await send(FILEHELPER, note)
+    collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
 
 
 def chat_of_note(note: str) -> Chat | None:
@@ -340,7 +521,7 @@ async def instructed_flow(chat: Chat, instruction: str) -> None:
     try:
         await asyncio.sleep(random.uniform(2, 5))
         if not chat.peer:
-            chat.peer = await page.evaluate("m => window.__lcFind(m)", chat.cfg["match"])
+            chat.peer = await find_peer(chat)
         try:
             decision = await asyncio.to_thread(reply.compose_instructed, cfg_for(chat), chat.history, instruction)
         except Exception as e:  # noqa: BLE001 - keep the bot alive on any API failure
@@ -356,6 +537,8 @@ async def instructed_flow(chat: Chat, instruction: str) -> None:
 
 async def reply_flow(chat: Chat) -> None:
     await asyncio.sleep(random.uniform(*config.READ_DELAY))
+    if chat.sent_at:  # don't fire replies back-to-back: leave a human-ish gap since the last one
+        await asyncio.sleep(max(0.0, MIN_REPLY_GAP_SECONDS - (time.time() - chat.sent_at[-1])))
     if paused(chat):
         return
     hour_ago = time.time() - 3600
@@ -393,7 +576,8 @@ async def ask_me(chat: Chat, question: str) -> None:
             f"在这里回答（最好引用这条），我照着回")
     log(f"[{chat.key}] 问你：{question}")
     log_filehelper(note, time.time())
-    await send(FILEHELPER, note)
+    res = await send(FILEHELPER, note)
+    collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
 
 
 async def send_lines(chat: Chat, lines: list[str], *, opener: bool = False) -> None:
@@ -403,11 +587,12 @@ async def send_lines(chat: Chat, lines: list[str], *, opener: bool = False) -> N
             await asyncio.sleep(typing_delay(line))
             if paused(chat):
                 break
-            res = await send(chat.peer, line)
+            res = await send_line(chat, line)
             if not res["ok"]:
-                log(f"[{chat.key}] 发送失败：{line}")
+                log(f"[{chat.key}] 发送失败：{line} {res.get('step', '')} {res.get('detail') or ''}")
                 break
             seen_ids.add(res["id"])
+            collect_sent(chat.peer, chat.cfg["name"], line, res["id"])
             record(chat, "我", line, time.time(), auto=True, opener=opener)
             chat.sent_at.append(time.time())
             log(f"[{chat.key}] 我（{'主动' if opener else '自动'}）：{line}")
@@ -445,7 +630,7 @@ def opener_due(chat: Chat) -> bool:
 async def open_topic(chat: Chat) -> None:
     chat.last_open_try = time.time()
     if not chat.peer:
-        chat.peer = await page.evaluate("m => window.__lcFind(m)", chat.cfg["match"])
+        chat.peer = await find_peer(chat)
         if not chat.peer:
             log(f"[{chat.key}] 想主动开话题，但在通讯录里没找到这个对话")
             return
@@ -480,6 +665,7 @@ def schedule_reply(chat: Chat) -> None:
 
 
 async def on_push(msg: dict) -> None:
+    collect(msg)
     if msg["id"] in seen_ids:
         return
     if msg["peer"] == FILEHELPER:
@@ -514,6 +700,25 @@ async def on_push(msg: dict) -> None:
     schedule_reply(chat)
 
 
+async def sticker_self_test(name: str) -> None:
+    """LC_STICKER_TEST=<name>: after login, send stickers/<name>.* to 文件传输助手."""
+    await asyncio.sleep(3)
+    path = next(iter(sorted(prompts.STICKER_DIR.glob(f"{name}.*"))), None)
+    if path is None:
+        log(f"[表情包测试] 没找到 stickers/{name}.*")
+        return
+    res = await send_sticker(FILEHELPER, path)
+    collect_sent(FILEHELPER, "文件传输助手", f"[表情包:{path.stem}]", res.get("id", ""))
+    log(f"[表情包测试] {path.name} 发给文件传输助手：{'成功' if res['ok'] else '失败'} {res}")
+    if not res["ok"]:
+        # Local-only debugging aid: what the upload needs, so it can be retried by hand.
+        info = await page.evaluate("() => window.__lcUploadInfo()")
+        dump = {"info": info, "cookies": await ctx.cookies([info["uploadUrl"]]),
+                "ua": await page.evaluate("() => navigator.userAgent")}
+        (DATA_DIR / "_upload_debug.json").write_text(json.dumps(dump, ensure_ascii=False))
+        log("[表情包测试] 调试信息写到 data/_upload_debug.json（调通后删掉）")
+
+
 async def watch() -> None:
     """Report login state changes and act on the RESUME file."""
     global logged_in
@@ -527,6 +732,8 @@ async def watch() -> None:
         if ok and not logged_in:
             log("已登录，开始监听：" + "、".join(c.cfg["name"] for c in chats.values()))
             asyncio.create_task(catch_up_after_login())
+            if test := os.environ.get("LC_STICKER_TEST"):
+                asyncio.create_task(sticker_self_test(test))
         elif not ok and logged_in:
             log("网页掉线或在重新加载，如果出现二维码请重新扫码")
         logged_in = ok
@@ -534,12 +741,18 @@ async def watch() -> None:
 
 
 async def main() -> None:
-    global page
+    global page, ctx
     DATA_DIR.mkdir(exist_ok=True)
     for key, cfg in config.TARGETS.items():
+        if not cfg.get("enabled", True):
+            continue
         chats[key] = Chat(key, cfg)
         load_history(chats[key])
     load_control_state()
+    CORPUS_DIR.mkdir(exist_ok=True)
+    load_bot_texts()
+    if BOT_SENT_FILE.exists():
+        bot_sent_ids.update(BOT_SENT_FILE.read_text(encoding="utf-8").split())
 
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
@@ -564,6 +777,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # launchd stops/restarts with SIGTERM: shut down as cleanly as on Ctrl+C.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

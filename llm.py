@@ -40,9 +40,12 @@ def _get_client() -> OpenAI:
     return _client
 
 
-def chat(
-    system: str,
-    user: str,
+def chat(system: str, user: str, **kw) -> str:
+    return chat_messages([{"role": "system", "content": system}, {"role": "user", "content": user}], **kw)
+
+
+def chat_messages(
+    messages: list[dict],
     *,
     max_tokens: int = 300,
     temperature: float = 0.8,
@@ -51,10 +54,7 @@ def chat(
     """reasoning_effort=None disables thinking (fast); "low"/"medium"/"high" enables it."""
     kwargs = {
         "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": messages,
         "max_tokens": max_tokens,
         "extra_headers": EXTRA_HEADERS,
     }

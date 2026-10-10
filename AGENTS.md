@@ -41,6 +41,14 @@ Notes for coding agents working on this repo. See README.md for what the project
 - **A failing style check ends in `skip`, not `handoff`.** Only real "the user should handle this"
   cases hand off: suspicion, invites, anger, money, and the reviewer's handoff verdict.
 - **Instructions in 文件传输助手 override every check** (`compose_instructed`).
+- **The corpus (`data/corpus/`) labels authors by message id, not by the user's marker.** The bot
+  records every id it sends in `_bot_sent_ids.txt` (`collect_sent`). Rows sent before that existed
+  fall back to `history_*.jsonl` rows marked `auto` (`sent_by_bot`). Other people's messages are
+  only written as context once the user speaks in that chat; `COLLECT_EXCLUDE` chats are never written.
+- **Replies are generated as a continued chat** (`prompts.chat_messages`): my messages are the
+  assistant's turns, theirs are user turns, and notes such as rewrite feedback or openers go in a
+  trailing system message. Style comes from real exchanges (`real_examples`), which skip
+  HUMAN_MARKS lines and any talk about the bot itself (`META_RE`), or the bot learns to out itself.
 
 ## Working on prompts
 
