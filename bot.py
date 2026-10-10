@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +30,8 @@ PAUSE_FILE = ROOT / "PAUSE"
 RESUME_FILE = ROOT / "RESUME"  # touch to lift every pause (takeover/handoff) right away
 CATCH_UP_SECONDS = 30 * 60  # after login/RESUME, answer a chat whose last message is theirs and this recent
 REPLAY_SLACK_SECONDS = 30  # our own sends are logged with local time, the replay with server time
-ENGAGED_SECONDS = 180  # in mention-only groups, messages this soon after I spoke go to the model
+ENGAGED_SECONDS = 600  # in mention-only groups, messages this soon after I spoke go to the model
+ASK_WAIT_SECONDS = 10 * 60  # after asking me something in 文件传输助手, wait this long for my answer
 RESUMED_AT_FILE = DATA_DIR / "resumed_at"  # a RESUME outlives restarts
 OPENER_RETRY_SECONDS = 30 * 60  # after an opener attempt (sent or skipped), wait this long
 # 文件传输助手 is my control channel: the bot posts handoff notes there, and what I type
@@ -37,9 +39,16 @@ OPENER_RETRY_SECONDS = 30 * 60  # after an opener attempt (sent or skipped), wai
 FILEHELPER_LOG = DATA_DIR / "history_filehelper.jsonl"
 DONE_FILE = DATA_DIR / "instructions_done.json"
 PAUSES_FILE = DATA_DIR / "pauses.json"  # handoff pauses outlive restarts
+# {chat key: time}: a chat I reset. Anything older is ignored, including the replay
+# web WeChat sends after every login, so the chat really starts from scratch.
+FORGET_FILE = DATA_DIR / "forget.json"
 NOTE_PREFIX = "【lover_chat】"
 INSTRUCTION_MAX_AGE = 30 * 60  # older instructions (e.g. replayed after a long downtime) are ignored
 NOTE_ORDER_SLACK_SECONDS = 5  # notes carry local time, my messages server time
+# A WeChat quote-reply as web WeChat renders it: "<sender>: <quoted>" / a dashed line / my words.
+QUOTE_RE = re.compile(r'^"(.+?)"\s*\n\s*(?:-\s*){3,}\n(.*)$', re.S)
+NOTE_RE = re.compile(re.escape(NOTE_PREFIX) + r"(.+?) (?:需要你接手|想问你)")
+ASK_RE = re.compile(r"想问你：(.*)")
 HOOK_JS = (ROOT / "hook.js").read_text(encoding="utf-8")
 WX_URL = "https://wx2.qq.com/"
 FILEHELPER = "filehelper"
@@ -63,6 +72,7 @@ class Chat:
     opener_at: list[float] = field(default_factory=list)  # when the bot started a topic
     last_open_try: float = 0.0
     memory_task: asyncio.Task | None = None
+    forget_before: float = 0.0  # set when I reset this chat; older messages are ignored
 
 
 page: Page
@@ -111,6 +121,10 @@ def load_control_state() -> None:
         for key, until in json.loads(PAUSES_FILE.read_text()).items():
             if key in chats:
                 chats[key].paused_until = max(chats[key].paused_until, until)
+    if FORGET_FILE.exists():
+        for key, since in json.loads(FORGET_FILE.read_text()).items():
+            if key in chats:
+                chats[key].forget_before = since
 
 
 def save_pauses() -> None:
@@ -257,8 +271,31 @@ async def hand_off(chat: Chat, reason: str) -> None:
     await send(FILEHELPER, note)
 
 
+def chat_of_note(note: str) -> Chat | None:
+    """The chat a note was about: "【lover_chat】<name> 需要你接手：…" or "… 想问你：…"."""
+    m = NOTE_RE.match(note)
+    return next((c for c in chats.values() if m and c.cfg["name"] == m.group(1)), None)
+
+
+def with_question(note: str, answer: str) -> str:
+    """If the note asked me something, hand the model the question along with my answer."""
+    m = ASK_RE.search(note)
+    return f"你之前问我：{m.group(1)}\n我的回答：{answer}" if m else answer
+
+
 def instruction_target(text: str, ts: float) -> tuple[Chat | None, str]:
-    """Which chat an instruction is for: a "对话名：" prefix, else the latest handoff note."""
+    """Which chat an instruction is for, and the instruction itself.
+
+    Best: a quote-reply to one of my handoff notes, which pins the chat exactly. Then a
+    "对话名：" prefix. Else the latest handoff note.
+    """
+    quote = QUOTE_RE.match(text)
+    if quote:
+        quoted, instruction = quote.group(1), quote.group(2).strip()
+        quoted = re.sub(r"^[^:：]{1,30}[:：]\s*", "", quoted)  # drop the "<sender>: " of the quote
+        if quoted.startswith(NOTE_PREFIX) and (chat := chat_of_note(quoted)):
+            return chat, with_question(quoted, instruction)
+        text = instruction
     for chat in chats.values():
         for name in (chat.cfg["name"], chat.key):
             for sep in ("：", ":"):
@@ -266,11 +303,8 @@ def instruction_target(text: str, ts: float) -> tuple[Chat | None, str]:
                     return chat, text[len(name) + len(sep):].strip()
     notes = [r for r in filehelper_rows
              if r["text"].startswith(NOTE_PREFIX) and r["time"] <= ts + NOTE_ORDER_SLACK_SECONDS]
-    if notes:
-        name = notes[-1]["text"][len(NOTE_PREFIX):].split(" 需要你接手")[0]
-        for chat in chats.values():
-            if chat.cfg["name"] == name:
-                return chat, text
+    if notes and (chat := chat_of_note(notes[-1]["text"])):
+        return chat, with_question(notes[-1]["text"], text)
     return None, text
 
 
@@ -344,7 +378,22 @@ async def reply_flow(chat: Chat) -> None:
     if decision.kind == "handoff":
         await hand_off(chat, decision.reason)
         return
+    if decision.kind == "ask":
+        await ask_me(chat, decision.reason)
+        return
     await send_lines(chat, decision.lines)
+
+
+async def ask_me(chat: Chat, question: str) -> None:
+    """The bot needs a fact only I know: ask in 文件传输助手 and hold the chat until I answer."""
+    chat.paused_until = time.time() + ASK_WAIT_SECONDS
+    save_pauses()
+    last = chat.history[-1]["text"] if chat.history else ""
+    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 想问你：{question}\n最后一条：{last}\n"
+            f"在这里回答（最好引用这条），我照着回")
+    log(f"[{chat.key}] 问你：{question}")
+    log_filehelper(note, time.time())
+    await send(FILEHELPER, note)
 
 
 async def send_lines(chat: Chat, lines: list[str], *, opener: bool = False) -> None:
@@ -441,6 +490,8 @@ async def on_push(msg: dict) -> None:
     if chat is None:
         return
     seen_ids.add(msg["id"])
+    if msg["time"] <= chat.forget_before:
+        return  # from before I reset this chat
     chat.peer = msg["peer"]
     if already_recorded(chat, msg["sender"], msg["text"], msg["time"]):
         return

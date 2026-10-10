@@ -12,11 +12,13 @@ SYSTEM = """\
 你在微信上替“我”回消息。对方以为一直是我本人在打字，所以你就是我：用第一人称，绝不能暴露自己是 AI 或者在替别人回。
 
 ## 最高优先级规矩（比“像我”更重要）
-{commit_rule}- 不编事实：聊天记录和下面资料里没有的事（我在哪、在干嘛、今天经历了什么、以前发生过什么），一律含糊带过
+{commit_rule}- 不编事实：聊天记录和下面资料里没有的事（我在哪、在干嘛、今天经历了什么、以前发生过什么），一律含糊带过；真需要这个事实才能回好时，按下面的 [ASK] 问我
 {ai_rule}
 - 注意记录里每件事是谁说的、谁做的，别张冠李戴：标着“我”的话就是我自己说的、我自己的事
 - 不替我承认或否认关于我自己的事（身材、收入、经历、我说过的话是真是假），别说“瞎编的”“确实是真的”；被夸或被调侃就轻松接一句（“哈哈”“过奖”“还行吧”），不下结论
-{handoff_rule}- 对话已经明显结束（晚安、拜拜、对方说去忙了），只输出 [SKIP]；对方只回“嗯嗯”“哈哈”时，可以 [SKIP]，也可以换个新话题（别追问刚才那个）
+{handoff_rule}- 对方直接问我一个具体的事实（哪个项目、链接/地址发我、开源了没、哪家公司、什么时候、在哪），而你不知道答案时，只输出一行“[ASK] 想问我的问题”，我会在文件传输助手告诉你答案；别编答案，也别用“不方便说”“自己捣鼓的”搪塞。只有闲聊式的随口一问（在干嘛、吃了没）才含糊带过
+  例：“你那个项目开源了吗 地址发我” → [ASK] 他要项目地址，开源了吗？链接是啥
+- 对话已经明显结束（晚安、拜拜、对方说去忙了），只输出 [SKIP]；对方只回“嗯嗯”“哈哈”时，可以 [SKIP]，也可以换个新话题（别追问刚才那个）
 
 ## 我是谁
 {me}
@@ -186,7 +188,8 @@ INSTRUCTED = """\
 最近的聊天记录（“我”就是我本人，最新的在最后）：
 {lines}
 
-我本人刚交代了这次怎么回：{instruction}
+我本人刚交代了：{instruction}
+（可能是告诉你这次怎么回，也可能是回答你之前问我的问题，把答案自然地用进回复里）
 照我交代的意思回；如果我给的就是原话，就原样发。我交代的优先于上面所有规矩，这次不许输出 [SKIP] 或 [HANDOFF]。
 保持我的说话风格，直接输出要发的消息，每行一条。"""
 
@@ -281,7 +284,7 @@ GIRL_HANDOFF = re.compile(
 
 @dataclass
 class Decision:
-    kind: str  # "reply" | "skip" | "handoff"
+    kind: str  # "reply" | "skip" | "handoff" | "ask" (reason = the question for me)
     lines: list[str] = field(default_factory=list)
     reason: str = ""
 
@@ -459,6 +462,8 @@ def suspicion(history: list[dict]) -> str | None:
 
 def parse_reply(raw: str) -> Decision:
     text = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+    if "[ASK]" in text:
+        return Decision("ask", reason=text.split("[ASK]", 1)[1].strip().splitlines()[0] or "这个怎么回")
     if "[HANDOFF]" in text:
         return Decision("handoff", reason=text.split("[HANDOFF]", 1)[1].strip() or "模型拿不准")
     if not text or "[SKIP]" in text:
