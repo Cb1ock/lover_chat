@@ -2,3 +2,4 @@ playwright
 openai
 python-dotenv
 httpx
+pillow

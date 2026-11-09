@@ -11,6 +11,7 @@ STATUS_FILE = Path(__file__).with_name("status.txt")
 MY_NAMES = ["你的微信昵称"]  # how I show up in chats; used to spot @s and quote-replies to me
 CALL_NAMES = ["你的外号"]    # what people call me in plain text; counts as possibly talking to me
 HUMAN_MARKS = ["me"]        # I start a message with “me:” to show it's really me typing; the bot never uses it
+COLLECT_ONLY = []  # chats to collect besides hers (her "girl" targets are always collected)
 COLLECT_EXCLUDE = []  # chats never written to data/corpus (matched by name)
 
 # About me. The model is told never to invent facts, so anything not written here
@@ -36,7 +37,17 @@ TARGETS = {
         "match": {"remark": "她的备注名"},
         "name": "她",
         "kind": "girl",
-        "stage": "暧昧",  # 刚认识 / 暧昧 / 恋爱 — sets how close the bot may get
+        "stage": "暧昧",  # 刚认识 / 暧昧 / 恋爱 / 朋友 / 升温 (friends, slowly warming up): how close the bot may get
+        # Optional, all off unless set:
+        # "max_chars": 10,         # keep replies short: lengths are sampled from my real replies in this chat,
+        #                          # mostly within max_chars with a long tail (prompts.sample_shape)
+        # "flirt_review": True,    # flirt.py drafts a cheeky line when she leaves an opening; it goes to
+        #                          # 文件传输助手 next to the normal reply and I pick ("发" / "普通"), else normal
+        # "sticker_check": True,   # a vision model looks at each sticker before it goes out, drops misfits
+        # "faces": False,          # no WeChat faces ([旺柴]...), emoji instead
+        # "stickers": False,       # no stickers at all in this chat
+        # "mirror": True,          # copy every reply to 文件传输助手
+        # invite (default True): let invite.py suggest asking her out; False turns it off
         # guardrails (default True): never promise anything for me; hand the chat to me when
         # she asks to meet, gets upset or suspects a bot.
         "about": "我们是什么关系、认识多久、我平时怎么称呼她、她的性格、最近在忙什么、她不喜欢什么。",

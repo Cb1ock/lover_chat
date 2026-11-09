@@ -10,6 +10,7 @@ file named RESUME to end that early.
 from __future__ import annotations
 
 import asyncio
+import html
 import collections
 import hashlib
 import json
@@ -26,6 +27,9 @@ import httpx
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 import config
+import flirt
+import invite
+import llm
 import memory
 import prompts
 import reply
@@ -34,12 +38,14 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".wx_profile"
 DATA_DIR = ROOT / "data"
 PAUSE_FILE = ROOT / "PAUSE"
-RESUME_FILE = ROOT / "RESUME"  # touch to lift every pause (takeover/handoff) right away
+RESUME_FILE = ROOT / "RESUME"
+SAY_FILE = ROOT / "SAY"  # "<key>|<instruction>": like writing that instruction in 文件传输助手  # touch to lift every pause (takeover/handoff) right away
 CATCH_UP_SECONDS = 30 * 60  # after login/RESUME, answer a chat whose last message is theirs and this recent
 REPLAY_SLACK_SECONDS = 30  # our own sends are logged with local time, the replay with server time
 ENGAGED_SECONDS = 600  # in mention-only groups, messages this soon after I spoke go to the model
 ASK_WAIT_SECONDS = 10 * 60  # after asking me something in 文件传输助手, wait this long for my answer
-MIN_REPLY_GAP_SECONDS = 20  # at least this long between two auto replies in the same chat
+MIN_REPLY_GAP_SECONDS = 20
+GIRL_MEMORY_EVERY = 8  # her plans and news should be remembered soon, not after 15 messages  # at least this long between two auto replies in the same chat
 # Every chat web WeChat sees, one file per chat, each line labelled me / ai / other.
 # AI is told apart by the message ids the bot itself sent (persisted, so replays after a
 # restart are still recognised), never by my HUMAN_MARKS prefix.
@@ -61,7 +67,14 @@ INSTRUCTION_MAX_AGE = 30 * 60  # older instructions (e.g. replayed after a long 
 NOTE_ORDER_SLACK_SECONDS = 5  # notes carry local time, my messages server time
 # A WeChat quote-reply as web WeChat renders it: "<sender>: <quoted>" / a dashed line / my words.
 QUOTE_RE = re.compile(r'^"(.+?)"\s*\n\s*(?:-\s*){3,}\n(.*)$', re.S)
-NOTE_RE = re.compile(re.escape(NOTE_PREFIX) + r"(.+?) (?:需要你接手|想问你)")
+NOTE_RE = re.compile(re.escape(NOTE_PREFIX) + r"(.+?) (?:需要你接手|想问你|适合约她|刚回了|可以撩一下)")
+FLIRT_RE = re.compile(r"骚的：(.*)\n普通：(.*)")
+NORMAL_RE = re.compile(r"^\s*(普通|正常|不发|算了|别发|不要)\s*[!！。.]?\s*$")
+MIRROR_RE = re.compile(r"刚回了[^\n]*\n(?:.*\n)*?我：(.*)")
+CORRECTION_PREFIX = "你刚才替我回了："
+INVITE_RE = re.compile(r"适合约她：(.*)")
+SAY_RE = re.compile(r"^(?:跟她说|和她说|回她|告诉她|你就说|就说|发)[:：，,\s]*(.*)$", re.S)
+YES_RE = re.compile(r"^\s*(发|可以|好|行|ok|嗯|发吧|就这样)\s*[!！。.]?\s*$", re.I)
 ASK_RE = re.compile(r"想问你：(.*)")
 HOOK_JS = (ROOT / "hook.js").read_text(encoding="utf-8")
 WX_URL = "https://wx2.qq.com/"
@@ -73,6 +86,8 @@ class Chat:
     key: str
     cfg: dict
     peer: str = ""  # web WeChat UserName; changes on every login, so learned from traffic
+    asked_at: float = 0.0  # when the bot last asked me something in 文件传输助手 (handoff/ask/invite)
+    flirt_pending: dict | None = None  # {"flirt", "normal", "at"} waiting for me to pick in 文件传输助手
     history: list[dict] = field(default_factory=list)
     task: asyncio.Task | None = None
     sending: bool = False
@@ -196,7 +211,7 @@ def collect(msg: dict) -> None:
         # A group web WeChat hasn't loaded yet: file it under its UserName for now and
         # merge it into the named file once a later message carries the name.
         name = peer_names.get(msg["peer"], (msg["peer"], msg["isGroup"]))[0]
-    if any(x in name for x in getattr(config, "COLLECT_EXCLUDE", [])):
+    if not collectable(name):
         return
     author = "other"
     if msg["fromMe"]:
@@ -222,6 +237,14 @@ def load_bot_texts() -> None:
             row = json.loads(line) if line.strip() else {}
             if row.get("auto"):
                 bot_texts.setdefault(row["text"], []).append(row["time"])
+
+
+def collectable(name: str) -> bool:
+    """Only her chats and ones I list in COLLECT_ONLY are logged; COLLECT_EXCLUDE always wins."""
+    if any(x in name for x in getattr(config, "COLLECT_EXCLUDE", [])):
+        return False
+    hers = [v for c in config.TARGETS.values() if c.get("kind") == "girl" for v in c["match"].values()]
+    return any(x and x in name for x in hers + list(getattr(config, "COLLECT_ONLY", [])))
 
 
 def adopt_unnamed(peer: str, name: str) -> None:
@@ -251,7 +274,7 @@ def collect_sent(peer: str, fallback_name: str, text: str, msg_id: str) -> None:
     with BOT_SENT_FILE.open("a", encoding="utf-8") as f:
         f.write(msg_id + "\n")
     name, is_group = peer_names.get(peer, (fallback_name, peer.startswith("@@")))
-    if any(x in name for x in getattr(config, "COLLECT_EXCLUDE", [])):
+    if not collectable(name):
         return
     corpus_write(name, is_group, {"id": msg_id, "time": int(time.time()), "sender": "我", "author": "ai",
                                   "marked": False, "type": 1, "text": text})
@@ -277,8 +300,9 @@ def record(chat: Chat, sender: str, text: str, ts: float, *,
 
 def cfg_for(chat: Chat) -> dict:
     """The chat's config plus its long-term memory and my real exchanges, as the prompts expect it."""
-    return {**chat.cfg, "memory": memory.load(chat.key)["facts"],
-            "examples": prompts.real_examples(chat.key, chat.cfg["kind"])}
+    mem = memory.load(chat.key)
+    return {**chat.cfg, "key": chat.key, "memory": mem["facts"], "pinned": mem["pinned"], "corrections": mem["corrections"],
+            "examples": prompts.real_examples(chat.key, chat.cfg["kind"], stage=chat.cfg.get("stage"))}
 
 
 def remember(chat: Chat) -> None:
@@ -288,7 +312,8 @@ def remember(chat: Chat) -> None:
 
     async def run() -> None:
         try:
-            folded = await asyncio.to_thread(memory.catch_up, chat.key)
+            every = GIRL_MEMORY_EVERY if chat.cfg.get("kind") == "girl" else memory.EVERY
+            folded = await asyncio.to_thread(memory.catch_up, chat.key, minimum=every)
             if folded:
                 log(f"[{chat.key}] 整理了 {folded} 条聊天进长期记忆")
         except Exception as e:  # noqa: BLE001 - memory is best-effort
@@ -337,13 +362,13 @@ def might_be_for_me(chat: Chat, msg: dict) -> bool:
     return msg.get("mentionsMe") or mentions_me(msg["text"]) or engaged(chat)
 
 
-def catch_up() -> None:
+def catch_up(max_age: float = CATCH_UP_SECONDS) -> None:
     """Answer chats whose last message is theirs, recent, and still unanswered."""
     for chat in chats.values():
         last = chat.history[-1] if chat.history else None
         if not (chat.peer and last) or paused(chat) or last["sender"] == "我":
             continue
-        if time.time() - last["time"] > CATCH_UP_SECONDS:
+        if time.time() - last["time"] > max_age:
             continue
         if chat.cfg.get("only_when_mentioned") and not mentions_me(last["text"]):
             continue
@@ -375,7 +400,7 @@ def resume_all() -> None:
     for chat in chats.values():
         chat.paused_until = 0.0
     save_pauses()
-    catch_up()
+    catch_up(max_age=12 * 3600)  # RESUME = "go on": also answer what piled up while I was away
 
 
 def typing_delay(line: str) -> float:
@@ -424,6 +449,27 @@ async def upload_media(path: Path, peer: str) -> str:
     return media_id
 
 
+def sticker_jpeg(path: Path) -> str:
+    """First frame of a sticker as base64 JPEG, for the vision model."""
+    import base64
+    import io
+    from PIL import Image
+    im = Image.open(path).convert("RGBA")
+    flat = Image.new("RGB", im.size, "white")
+    flat.paste(im, mask=im.split()[3])
+    buf = io.BytesIO()
+    flat.save(buf, "JPEG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+async def sticker_fits(chat: Chat, path: Path) -> tuple[bool, str]:
+    context = prompts.transcript(chat.history[-8:])
+    try:
+        return await asyncio.to_thread(llm.sticker_fits, sticker_jpeg(path), "image/jpeg", context)
+    except Exception as e:  # noqa: BLE001 - can't look: don't send it
+        return False, f"看不了图：{str(e)[:80]}"
+
+
 async def send_sticker(peer: str, path: Path) -> dict:
     try:
         media_id = await upload_media(path, peer)
@@ -435,13 +481,23 @@ async def send_sticker(peer: str, path: Path) -> dict:
 async def send_line(chat: Chat, line: str) -> dict:
     """Send one line of a reply: a [表情包:名字] line becomes a sticker, the rest text."""
     m = prompts.STICKER_LINE.match(line)
+    if m and not chat.cfg.get("stickers", True):
+        return {"ok": False, "step": "stickers off for this chat"}  # never send the raw [表情包:…] text
     if m and (path := prompts.stickers().get(m.group(1))):
+        if chat.cfg.get("sticker_check"):
+            fits, why = await sticker_fits(chat, path)
+            if not fits:
+                log(f"[{chat.key}] 表情包「{path.stem}」不合适，没发：{why}")
+                return {"ok": True, "id": "", "skipped": True}
         return await send_sticker(chat.peer, path)
+    if m:
+        return {"ok": True, "id": "", "skipped": True}  # unknown sticker name: never send the raw text
     return await send(chat.peer, line)
 
 
 async def hand_off(chat: Chat, reason: str) -> None:
     chat.paused_until = time.time() + config.HANDOFF_PAUSE_SECONDS
+    chat.asked_at = time.time()
     save_pauses()
     last = chat.history[-1]["text"] if chat.history else ""
     note = (f"{NOTE_PREFIX}{chat.cfg['name']} 需要你接手：{reason}\n最后一条：{last}\n"
@@ -459,7 +515,20 @@ def chat_of_note(note: str) -> Chat | None:
 
 
 def with_question(note: str, answer: str) -> str:
-    """If the note asked me something, hand the model the question along with my answer."""
+    """If the note asked me something, hand the model the question along with my answer;
+    a "发" to an invitation suggestion means: send that line as it is."""
+    if m := FLIRT_RE.search(note):
+        if YES_RE.match(answer):
+            return f"原话发这句：{m.group(1)}"
+        if NORMAL_RE.match(answer):
+            return f"原话发这句：{m.group(2)}" if m.group(2) != "（不回）" else "你建议撩她，我说算了：这次不回，输出 [SKIP]"
+        return f"你建议撩她：{m.group(1)}\n我的意思：{answer}"
+    if m := MIRROR_RE.search(note):
+        return f"{CORRECTION_PREFIX}{m.group(1)}\n我的纠正：{answer}\n需要的话按纠正补一句或改口，不需要就输出 [SKIP]"
+    if (m := INVITE_RE.search(note)) and YES_RE.match(answer):
+        return f"原话发这句：{m.group(1)}"
+    if m:
+        return f"你建议约她：{m.group(1)}\n我的意思：{answer}"
     m = ASK_RE.search(note)
     return f"你之前问我：{m.group(1)}\n我的回答：{answer}" if m else answer
 
@@ -482,6 +551,8 @@ def instruction_target(text: str, ts: float) -> tuple[Chat | None, str]:
             for sep in ("：", ":"):
                 if text.startswith(name + sep):
                     return chat, text[len(name) + len(sep):].strip()
+    if len(chats) == 1:
+        return next(iter(chats.values())), text
     notes = [r for r in filehelper_rows
              if r["text"].startswith(NOTE_PREFIX) and r["time"] <= ts + NOTE_ORDER_SLACK_SECONDS]
     if notes and (chat := chat_of_note(notes[-1]["text"])):
@@ -489,10 +560,70 @@ def instruction_target(text: str, ts: float) -> tuple[Chat | None, str]:
     return None, text
 
 
+def parse_record(raw: str) -> list[tuple[str, str, float]]:
+    """(sender name, text, time) of each line in a forwarded chat record's XML."""
+    xml = html.unescape(html.unescape(raw.replace("<br/>", "\n")))
+    m = re.search(r"<recorditem>(.*?)</recorditem>", xml, re.S)
+    body = html.unescape(m.group(1)) if m else xml
+    out = []
+    for item in re.findall(r"<dataitem\b(.*?)</dataitem>", body, re.S):
+        get = lambda tag: (re.search(rf"<{tag}>(.*?)</{tag}>", item, re.S) or [None, ""])[1].strip()
+        name, text = get("sourcename"), get("datadesc") or get("datatitle")
+        ts = get("srcMsgCreateTime") or get("sourcetime")
+        try:
+            when = float(ts) if ts.isdigit() else time.mktime(time.strptime(ts[:16], "%Y-%m-%d %H:%M"))
+        except ValueError:
+            when = 0.0
+        if name and text:
+            out.append((name, text, when))
+    return out
+
+
+def merge_record(msg: dict) -> bool:
+    """I forwarded a stretch of chat I had myself: add it to that chat's history as context."""
+    rows = parse_record(msg.get("raw", ""))
+    if not rows:
+        return False
+    names = {n for n, _, _ in rows}
+    chat = next((c for c in chats.values() if c.cfg["name"] in names or c.cfg["match"].get("remark") in names), None)
+    if chat is None and len(chats) == 1:
+        chat = next(iter(chats.values()))
+    if chat is None:
+        log(f"[文件传输助手] 收到转发的聊天记录（{'、'.join(sorted(names))}），但对不上监控的对话")
+        return True
+    me = msg.get("myNick") or ""
+    last = chat.history[-1]["time"] if chat.history else 0
+    added = 0
+    for i, (name, text, when) in enumerate(rows):
+        sender = "我" if name == me or (me == "" and name != chat.cfg["name"]) else chat.cfg["name"]
+        when = max(when or msg["time"] - len(rows) + i, last)
+        if already_recorded(chat, sender, text, when):
+            continue
+        record(chat, sender, text, when)
+        last, added = when, added + 1
+    log(f"[{chat.key}] 从你转发的聊天记录里补了 {added} 条（共 {len(rows)} 条）")
+    remember(chat)
+    if chat.history and chat.history[-1]["sender"] == "我":
+        log(f"[{chat.key}] 最后一条是你说的，等她回")
+    else:
+        schedule_reply(chat)
+    return True
+
+
 async def on_filehelper(msg: dict) -> None:
     text = msg["text"]
     log_filehelper(text, msg["time"])
     if not msg["fromMe"] or text.startswith(NOTE_PREFIX):
+        return
+    if msg.get("raw") and ("recorditem" in msg["raw"] or "暂不支持" in text):
+        if merge_record(msg):
+            return
+        if "暂不支持" in text:
+            log(f"[文件传输助手] 收到网页版看不了的消息，不当成指示：{msg['raw'][:200]}")
+            return
+    if "暂不支持的消息类型" in text:
+        (DATA_DIR / "_unsupported_debug.json").write_text(msg.get("raw", ""), encoding="utf-8")
+        log("[文件传输助手] 收到网页版看不了的消息，不当成指示")
         return
     key = f"{int(msg['time'])}|{text}"
     if key in done_instructions or time.time() - msg["time"] > INSTRUCTION_MAX_AGE:
@@ -508,9 +639,31 @@ async def on_filehelper(msg: dict) -> None:
         return
     done_instructions.add(key)
     DONE_FILE.write_text(json.dumps(sorted(done_instructions), ensure_ascii=False), encoding="utf-8")
+    quoted_note = bool(QUOTE_RE.match(text))
+    open_question = time.time() - chat.asked_at < ASK_WAIT_SECONDS
+    say = SAY_RE.match(instruction)
+    if say:
+        instruction = say.group(1).strip() or instruction
+    elif not (quoted_note or open_question or reply.CARRY_ON.match(instruction.strip())
+              or instruction.startswith(("原话发这句", "你之前问我", "你建议约她", CORRECTION_PREFIX))):
+        # Nothing was asked and it doesn't say "tell her": it's about how the bot talks.
+        memory.add_correction(chat.key, instruction.strip())
+        log(f"[{chat.key}] 记住了你的意见：{instruction.strip()}")
+        return
+    chat.asked_at = 0.0
+    chat.flirt_pending = None
+    if m := re.match(r"^(?:记住[:：，,\s]*)?((?:别|不要|以后|少|多)\S.*)", instruction, re.S) \
+            or re.match(r"^记住[:：，,\s]*(.+)", instruction, re.S):
+        memory.add_correction(chat.key, m.group(1).strip())  # a rule for later, nothing to send now
+        log(f"[{chat.key}] 记住了你的纠正：{m.group(1).strip()}")
+        return
     chat.paused_until = 0.0
     save_pauses()
     log(f"[{chat.key}] 收到你的指示：{instruction}")
+    if instruction.startswith(CORRECTION_PREFIX):
+        fix = instruction.split("我的纠正：", 1)[1].split("\n", 1)[0]
+        said = instruction[len(CORRECTION_PREFIX):].split("\n", 1)[0]
+        memory.add_correction(chat.key, f"（我回了“{said}”）{fix}")
     if chat.task and not chat.task.done():
         chat.task.cancel()
     chat.task = asyncio.create_task(instructed_flow(chat, instruction))
@@ -527,7 +680,13 @@ async def instructed_flow(chat: Chat, instruction: str) -> None:
         except Exception as e:  # noqa: BLE001 - keep the bot alive on any API failure
             log(f"[{chat.key}] 模型调用失败：{e}")
             return
-        await send_lines(chat, decision.lines)
+        if decision.kind == "ask":
+            await ask_me(chat, decision.reason)
+        elif decision.kind == "handoff":
+            await hand_off(chat, decision.reason)
+        elif decision.kind == "skip":
+            log(f"[{chat.key}] 按指示没发：{decision.reason}")
+        await send_lines(chat, decision.lines if decision.kind == "reply" else [])
     finally:
         chat.instructing = False
         if chat.dirty:  # they wrote while I was being obeyed: answer that next
@@ -564,24 +723,107 @@ async def reply_flow(chat: Chat) -> None:
     if decision.kind == "ask":
         await ask_me(chat, decision.reason)
         return
+    suggestion = None
+    if invite.due(chat.cfg, chat.key):
+        try:
+            suggestion = await asyncio.to_thread(invite.judge, cfg_for(chat), chat.key, chat.history)
+        except Exception as e:  # noqa: BLE001 - the judge is optional
+            log(f"[{chat.key}] 邀约判断失败：{e}")
+    limit = chat.cfg.get("max_chars")
+    if suggestion and suggestion["kind"] == "soft" and limit and \
+            prompts.reply_chars(decision.lines + [suggestion["line"]]) > limit:
+        log(f"[{chat.key}] 邀约这句太长，这次不带：{suggestion['line']}")
+        suggestion = None
+    if suggestion and suggestion["kind"] == "soft":
+        decision.lines.append(suggestion["line"])  # a light, no-commitment invite rides along
+        invite.mark_invited(chat.key, suggestion["line"])
+        log(f"[{chat.key}] 顺带轻邀约：{suggestion['line']}（{suggestion['reason']}）")
+    if chat.cfg.get("flirt_review"):
+        try:
+            cheeky = await asyncio.to_thread(flirt.judge, cfg_for(chat), chat.history, decision.lines)
+        except Exception as e:  # noqa: BLE001 - optional
+            log(f"[{chat.key}] 撩不撩判断失败：{e}")
+            cheeky = None
+        if cheeky:
+            await offer_flirt(chat, cheeky, decision.lines)
+            return
     await send_lines(chat, decision.lines)
+    if suggestion and suggestion["kind"] == "concrete":
+        await suggest_invite(chat, suggestion)
+
+
+FLIRT_WAIT_SECONDS = 8 * 60  # no pick by then: the normal reply goes out
+
+
+async def offer_flirt(chat: Chat, cheeky: dict, normal: list[str]) -> None:
+    """A cheeky line is mine to approve: put it next to the normal reply and let me pick."""
+    chat.paused_until = time.time() + FLIRT_WAIT_SECONDS
+    save_pauses()
+    chat.asked_at = time.time()
+    chat.flirt_pending = {"flirt": cheeky["line"], "normal": normal, "at": time.time()}
+    last = " / ".join(r["text"] for r in chat.history[-3:] if r["sender"] != "我") or chat.history[-1]["text"]
+    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 可以撩一下\n她：{last}\n"
+            f"骚的：{cheeky['line']}\n普通：{' / '.join(normal) or '（不回）'}\n"
+            f"（{cheeky['why']}）回“发”发骚的，回“普通”发普通的，或者直接写你想说的；"
+            f"{FLIRT_WAIT_SECONDS // 60} 分钟没回就发普通的")
+    log(f"[{chat.key}] 想撩：{cheeky['line']}（等你挑）")
+    log_filehelper(note, time.time())
+    res = await send(FILEHELPER, note)
+    collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
+    asyncio.create_task(flirt_timeout(chat, chat.flirt_pending))
+
+
+async def flirt_timeout(chat: Chat, pending: dict) -> None:
+    await asyncio.sleep(FLIRT_WAIT_SECONDS)
+    if chat.flirt_pending is not pending:
+        return  # I picked, or a newer offer replaced this one
+    chat.flirt_pending = None
+    chat.paused_until = 0.0
+    save_pauses()
+    if chat.history and chat.history[-1]["sender"] == "我":
+        return  # I answered her myself meanwhile
+    log(f"[{chat.key}] 你没挑，发普通的")
+    if pending["normal"]:
+        await send_lines(chat, pending["normal"])
+    if chat.history and chat.history[-1]["sender"] != "我":
+        schedule_reply(chat)  # she wrote more while we waited
+
+
+async def suggest_invite(chat: Chat, suggestion: dict) -> None:
+    """A concrete plan (a day, a place) is mine to commit to: suggest it, don't send it."""
+    chat.asked_at = time.time()
+    invite.mark_invited(chat.key, suggestion["line"])
+    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 适合约她：{suggestion['line']}\n理由：{suggestion['reason']}\n"
+            f"回复“发”就原样发出去，或者写你想怎么说（最好引用这条）")
+    log(f"[{chat.key}] 建议邀约：{suggestion['line']}")
+    log_filehelper(note, time.time())
+    res = await send(FILEHELPER, note)
+    collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
 
 
 async def ask_me(chat: Chat, question: str) -> None:
     """The bot needs a fact only I know: ask in 文件传输助手 and hold the chat until I answer."""
     chat.paused_until = time.time() + ASK_WAIT_SECONDS
+    chat.asked_at = time.time()
     save_pauses()
     last = chat.history[-1]["text"] if chat.history else ""
-    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 想问你：{question}\n最后一条：{last}\n"
-            f"在这里回答（最好引用这条），我照着回")
+    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 想问你：{question}\n对方最后一条：{last}\n"
+            f"直接在这里回（最好引用这条），我照你的意思回")
     log(f"[{chat.key}] 问你：{question}")
     log_filehelper(note, time.time())
     res = await send(FILEHELPER, note)
     collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
 
 
+WECHAT_FACE = re.compile(r"\[[\u4e00-\u9fa5A-Za-z]{1,6}\]")
+
+
 async def send_lines(chat: Chat, lines: list[str], *, opener: bool = False) -> None:
+    if not chat.cfg.get("faces", True):
+        # WeChat's own faces ([旺柴], [捂脸]) off here: I'd rather use emoji.
+        lines = [s for s in (WECHAT_FACE.sub("", l).strip() for l in lines) if s]
     chat.sending = True
+    sent: list[str] = []
     try:
         for line in lines:
             await asyncio.sleep(typing_delay(line))
@@ -591,16 +833,40 @@ async def send_lines(chat: Chat, lines: list[str], *, opener: bool = False) -> N
             if not res["ok"]:
                 log(f"[{chat.key}] 发送失败：{line} {res.get('step', '')} {res.get('detail') or ''}")
                 break
+            if res.get("skipped"):
+                continue  # a sticker that didn't fit: nothing went out
             seen_ids.add(res["id"])
             collect_sent(chat.peer, chat.cfg["name"], line, res["id"])
             record(chat, "我", line, time.time(), auto=True, opener=opener)
             chat.sent_at.append(time.time())
             log(f"[{chat.key}] 我（{'主动' if opener else '自动'}）：{line}")
+            sent.append(line)
     finally:
         chat.sending = False
+    if sent and chat.cfg.get("mirror"):
+        await mirror(chat, sent, opener)
     if chat.dirty:
         chat.dirty = False
         schedule_reply(chat)
+
+
+async def mirror(chat: Chat, sent: list[str], opener: bool) -> None:
+    """Copy what I just said to 文件传输助手, with what it answered, so I can check it."""
+    before = [r for r in chat.history if r["text"] not in sent or r["sender"] != "我"]
+    theirs = []
+    for r in reversed(before):
+        if r["sender"] == "我":
+            break
+        theirs.insert(0, r["text"])
+    head = "（主动开的话题）" if opener or not theirs else "她：" + " / ".join(theirs[-4:])
+    note = (f"{NOTE_PREFIX}{chat.cfg['name']} 刚回了\n{head}\n我：{' / '.join(sent)}\n"
+            f"有不对的引用这条告诉我，我会改口并记住")
+    log_filehelper(note, time.time())
+    try:
+        res = await send(FILEHELPER, note)
+        collect_sent(FILEHELPER, "文件传输助手", note, res.get("id", ""))
+    except Exception as e:  # noqa: BLE001 - the copy is a convenience, never block the chat
+        log(f"[{chat.key}] 抄送文件传输助手失败：{e}")
 
 
 def opener_due(chat: Chat) -> bool:
@@ -664,6 +930,21 @@ def schedule_reply(chat: Chat) -> None:
     chat.task = asyncio.create_task(reply_flow(chat))
 
 
+async def look_at(chat: Chat, msg: dict) -> str:
+    """"[图片：…]" with what the picture shows, or plain "[图片]" if I can't see it."""
+    try:
+        img = await page.evaluate("id => window.__lcImage ? window.__lcImage(id) : null", msg["id"])
+        if not img or not img.get("ok"):
+            raise RuntimeError((img or {}).get("detail", "下载失败"))
+        desc = await asyncio.to_thread(llm.describe_image, img["data"], img["mime"])
+        if desc:
+            log(f"[{chat.key}] 看了图：{desc}")
+            return f"[图片：{desc}]"
+    except Exception as e:  # noqa: BLE001 - without sight the bot asks me instead
+        log(f"[{chat.key}] 看图失败：{str(e)[:120]}")
+    return msg["text"]
+
+
 async def on_push(msg: dict) -> None:
     collect(msg)
     if msg["id"] in seen_ids:
@@ -681,6 +962,8 @@ async def on_push(msg: dict) -> None:
     chat.peer = msg["peer"]
     if already_recorded(chat, msg["sender"], msg["text"], msg["time"]):
         return
+    if msg["type"] == 3 and not msg["fromMe"] and msg["time"] >= started_at - REPLAY_SLACK_SECONDS:
+        msg["text"] = await look_at(chat, msg)
     record(chat, msg["sender"], msg["text"], msg["time"])
     log(f"[{chat.key}] {msg['sender']}：{msg['text']}")
     remember(chat)
@@ -725,6 +1008,16 @@ async def watch() -> None:
     while True:
         if RESUME_FILE.exists():
             resume_all()
+        if SAY_FILE.exists() and logged_in:
+            key, _, instruction = SAY_FILE.read_text(encoding="utf-8").strip().partition("|")
+            SAY_FILE.unlink()
+            if (chat := chats.get(key)) and instruction:
+                log(f"[{key}] 收到指示（SAY）：{instruction}")
+                chat.paused_until = 0.0
+                save_pauses()
+                if chat.task and not chat.task.done():
+                    chat.task.cancel()  # one reply at a time: my instruction replaces the bot's own
+                chat.task = asyncio.create_task(instructed_flow(chat, instruction))
         try:
             ok = await page.evaluate("() => !!window.__lcInstalled")
         except Exception:  # noqa: BLE001 - page mid-navigation
@@ -764,7 +1057,7 @@ async def main() -> None:
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         for attempt in range(1, 13):
             try:
-                await page.goto(WX_URL)
+                await page.goto(WX_URL, wait_until="domcontentloaded", timeout=60000)
                 break
             except Exception as e:  # noqa: BLE001 - flaky proxy/network; keep trying
                 log(f"打开网页失败（第 {attempt} 次），5 秒后重试：{str(e).splitlines()[0]}")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -76,7 +77,7 @@ GIRL_RULES = """\
 ## 示例（只学方法，别照抄原句）
 - 她：今天路上看到一只超胖的橘猫 赖在别人电动车上不走 → 哈哈哈画面感太强了 / 拍到没 我要看
 - 她：[图片] 下班路上拍的 → 停下来专门拍的吗 / 你挺会捕捉这种瞬间的
-- 她：[图片] 今晚的快乐 → 看着就香 / 哪家呀 你是辣锅派还是鸳鸯派
+- 她：[图片] 今晚的快乐 → 看着就香 / 哪家呀
 - 她：这两件哪件好看 [图片] → 左边那件 / 感觉更衬你
 - 她：又被领导当着全组面说了 无语 → 当着全组？也太不给人留面子了 / 因为啥事啊
 - 她：在想要不要直接找领导说清楚 → 你是想听我的想法 还是先吐槽完再说😂
@@ -93,7 +94,7 @@ GIRL_RULES = """\
 - 她：为什么海水是咸的 因为鱼在哭😂 → …… / 我笑了 但我不承认
 - 她：嗯嗯 → 那换个问题 / 明天突然放假一天你会干嘛
 - 她：在干嘛呢 → 在看你消息呀 / 你呢 今天忙完没
-- 她：好无聊啊 → 无聊找我就对了 / 出道题 火锅和烧烤只能选一个 你选哪个
+- 她：好无聊啊 → （吐槽一句或者逗她一下，再接一个她今天的具体事；别出题考她）
 - 她：哼 你都不夸我 → 我错了 现在补 / （夸一件聊天里她真说过、真发过的事）
 - 她：好想吃蛋糕🥺 可是这个点了 → 这个点想吃蛋糕是人之常情 / 想吃哪种 奶油还是巴斯克
 - 她：哼 → 怎么啦 谁惹你了 / 说出来 我站你这边
@@ -108,6 +109,25 @@ GIRL_RULES = """\
 - 她：考完了 感觉砸了😭 → 先抱抱 考完就先放下 / 哪部分让你觉得砸了"""
 
 GIRL_STAGES = {
+    "朋友": """\
+## 分寸：朋友（她已经明确说过更想当朋友）
+- 像普通好朋友那样聊：接她的工作吐槽、分享日常和好玩的事、正常开玩笑
+- 不暧昧：不说想你、宝宝、天生一对、对象、爱了这类话，不提身体和过夜的暗示，不追问关系，不发小作文
+- 她直接问你意见（好不好看、选哪个、怎么看）一定要回，而且先回这个：朋友也会真诚地夸、给建议，只是不带暧昧。看不到图也照样夸一句（“好看呀”“很衬你”），再问一句细节（“在哪买的”）
+- 不催、不黏：她回得慢或者回得短就收住，别连发；她分享的事认真接住、追问细节，让她觉得有回应
+- 别每句都以问句结尾，像在采访她；很多时候接住、附和、吐槽一句就够了，隔几轮再问一个
+- 不打听她的私事和行踪：跟谁去、和谁吃饭、男的女的这类别问""",
+    "升温": """\
+## 分寸：朋友，慢慢往暧昧走（目标是让她觉得跟我聊天开心、对我有点好感，不是表白）
+- 比普通朋友多一点在意：记得她说过的事并接着问（她的烦心事后来怎么样了、喜欢吃的），她吐槽时站她这边
+- 可以轻轻调侃、偶尔用资料里写的昵称，用我们之间的梗；夸具体的点（她的性格、她做成的事），别泛泛地夸好看
+- 一次只加一点温度：主要是接住她的话，偶尔逗一句；她回得短、说忙、不想说时就收住，别连发、别追问
+- 不表白、不说想你/宝宝/喜欢你、不提身体和过夜，不问“我们算什么”；她不想打电话就别再提
+- 可以顺着她的爱好留以后见面的由头（以后请她吃她爱吃的、一起去玩她喜欢的），但不定时间、不替我承诺
+- 别每句都以问句结尾，像在采访她；别没话找话、别出题考她（“出道题”“二选一”）
+- 别把话说死：只回“你谦虚了”“可以”这种就没下文了。接住之后顺手带个小钩子，让她好接着说（她在哪、在干嘛、接下来干嘛、照片里那地方），只是别连着两轮都问问题
+- 她回得短（“还好吧”“嗯”“哈哈”）不代表不想聊，别追问同一件事，换个她好接的点
+- 别提其他女生""",
     "刚认识": """\
 ## 分寸：刚认识
 - 不加称呼或叫名字，别叫宝贝、老婆；也别叫“兄弟”“铁子”
@@ -225,15 +245,17 @@ FACT_ABOUT_ME = re.compile(
     r"是干啥的|是做什么的|哪个学校|哪个城市|住哪|多大了|几岁|年薪|工资)")
 # An [ASK] that's really "how should I answer?" rather than a fact: just stay quiet.
 ASK_NOT_A_FACT = re.compile(r"怎么(说|回)|要不要|该不该|我该|该说|如何回|回什么|需不需要")
+# Their last message asks me something directly: staying quiet would be rude.
+DIRECT_QUESTION = re.compile(r"(吗|嘛|不|没|呢|咋样|怎么样|行不|好不|对吧|[？?])\s*$")
 UNREADABLE_REVIEW = "审核结果看不懂，保险起见交给你"
 
 # Checked in code before the model runs: the model tends to talk its way through these
 # instead of handing off.
 SUSPICION = re.compile(
-    r"机器人|(?<![A-Za-z])AI(?![A-Za-z])|人工智能|自动回复|GPT|豆包|deepseek|agent|bot|"
-    r"代发|代回|托管|真人|本人|怪怪的|不像你|谁在回|敷衍|"
-    # Asking which model "I" am; plain model talk ("GLM 新版发了") is fine in these chats.
-    r"你.{0,8}(模型|LLM|claude|千问|qwen|kimi|glm|文心)|(哪个|什么|啥)模型",
+    # Doubts aimed at me. Plain talk about AI ("AI电话有点脑残") is everyday topic, not doubt.
+    r"你.{0,8}(机器人|AI|人工智能|自动回复|GPT|豆包|deepseek|agent|bot|模型|LLM|claude|千问|qwen|kimi|glm|文心)|"
+    r"(是不是|是).{0,4}(机器人|AI|自动回复|agent|bot).{0,2}(在回|回的|发的|回复)|(哪个|什么|啥)模型|"
+    r"代发|代回|托管|是你本人|本人吗|真人吗|是真人|怪怪的|不像你|谁在回|敷衍",
     re.I,
 )
 # Phrases in a draft that bring up bots/AI chatting; never let the bot raise this itself.
@@ -253,11 +275,13 @@ COMMITMENT = re.compile(
     # A time word only counts when I'm the one being lined up: "我明天…" / "明天一起…".
     r"我(明天|明晚|今晚|周末|下班)|(明天|明晚|今晚|周末|下班)(我|一起|见|陪|带|去找|来找)"
 )
-# In a chat with her: she's asking to meet, or she's upset. Either way it's mine to handle.
-GIRL_HANDOFF = re.compile(
-    r"有空吗|有时间吗|出来(玩|吃|见)|见面|一起去|陪我去|要不要去|约(会|饭|你)|"
-    r"你每次都|随便你|算了吧?$|不想理你|你自己看着办|分手|冷静一下|生气了"
+# In a chat with her: she's asking to meet or about my plans (ask me: I'm the one who'd go),
+# or she's upset (mine to handle).
+GIRL_INVITE = re.compile(
+    r"有空吗|有时间吗|出来(玩|吃|见)|见面|见一面|一起(去|吃|玩|看)|吃个饭|吃饭吗|陪我去|要不要去|约(会|饭|你)|"
+    r"(你|啥时候|什么时候|下周|周末|这周).{0,6}来(北京|上海|找我)|(来|去)(北京|上海)吗"
 )
+GIRL_UPSET = re.compile(r"你每次都|随便你|算了吧?$|不想理你|你自己看着办|分手|冷静一下|生气了")
 
 
 @dataclass
@@ -268,8 +292,16 @@ class Decision:
 
 
 def memory_text(target: dict) -> str:
-    facts = target.get("memory") or []
-    return "\n".join(f"- {f}" for f in facts) if facts else "（暂无）"
+    pinned, facts = target.get("pinned") or [], target.get("memory") or []
+    corrections = target.get("corrections") or []
+    out = []
+    if corrections:
+        out.append("我（本人）纠正过你的地方（以后都照这个来，别再犯）：\n" + "\n".join(f"- {f}" for f in corrections))
+    if pinned:
+        out.append("关键信息（一定要记住，回复不能和它矛盾）：\n" + "\n".join(f"- {f}" for f in pinned))
+    if facts:
+        out.append("其他记忆：\n" + "\n".join(f"- {f}" for f in facts))
+    return "\n".join(out) or "（暂无）"
 
 
 STICKER_DIR = Path(__file__).with_name("stickers")
@@ -285,12 +317,31 @@ def stickers() -> dict[str, Path]:
             if p.suffix.lower() in STICKER_TYPES and not p.stem.startswith("_")}
 
 
-def sticker_rule() -> str:
-    names = list(stickers())
-    if not names:
-        return ""
-    return ("\n- 表情包：想发表情包时单独一行写 [表情包:名字]，只能用这些："
-            + "、".join(names) + "。偶尔用，一次最多一个，别连着几次都发")
+STICKER_DESC_FILE = STICKER_DIR / "_desc.json"  # what each sticker looks like (vision model)
+
+
+def sticker_descs() -> dict[str, str]:
+    try:
+        return json.loads(STICKER_DESC_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def sticker_rule(target: dict | None = None) -> str:
+    target = target or {}
+    rules = []
+    if not target.get("faces", True):
+        rules.append("- 这个对话里不用上面说的微信小黄脸代码（[旺柴][捂脸]这类）；想带点情绪就在句子里偶尔加一个 emoji"
+                     "（😂🤣😅🙃 这类），别单独只发一个 emoji")
+    names = list(stickers()) if target.get("stickers", True) else []
+    if names:
+        descs = sticker_descs()
+        listed = "、".join(f"{n}（{descs[n]}）" if n in descs else n for n in names)
+        rules.append("- 表情包：真觉得合适时单独一行写 [表情包:名字]，只能用这些：" + listed
+                     + "。少用：一次最多一个，前后几轮发过就别再发；拿不准就不发" + "（发之前还会再看一眼图，不合适会被拿掉）")
+    elif not target.get("stickers", True):
+        rules.append("- 这个对话里不发表情包（[表情包:…]）")
+    return "\n" + "\n".join(rules) if rules else ""
 
 
 def current_status() -> str:
@@ -307,6 +358,12 @@ def system_prompt(target: dict) -> str:
     kind_rules = KIND_RULES[kind]
     if kind == "girl":
         kind_rules += "\n\n" + GIRL_STAGES[target.get("stage", "暧昧")]
+    if shape := target.get("reply_shape"):
+        n, chars = shape
+        kind_rules += (f"\n\n## 这次回复的长度（最重要）\n- 这次最多 {n} 句，加起来不超过 {chars} 个字；"
+                       "像真人随手回的那样\n"
+                       "- 短不等于把话说死：光夸一句、光附和一句她就没法接了。"
+                       "说完要是她接不下去，再加一句不超过 8 个字、跟她刚说的事有关的小问题（只学方法，别照抄）")
     known = target.get("agent_known")
     if known:
         kind_rules += "\n\n" + AGENT_KNOWN_RULES
@@ -322,7 +379,7 @@ def system_prompt(target: dict) -> str:
         status=current_status(),
         memory=memory_text(target),
         examples=target.get("examples") or "（暂无）",
-        sticker_rule=sticker_rule(),
+        sticker_rule=sticker_rule(target),
         about=target["about"],
         kind_rules=kind_rules,
     )
@@ -354,26 +411,31 @@ def _gap(seconds: float) -> str:
     return f"{seconds / 3600:.0f} 小时" if seconds >= 3600 else f"{seconds / 60:.0f} 分钟"
 
 
-def real_examples(key: str, kind: str, limit_chars: int = 1600, before: float | None = None) -> str:
+def real_examples(key: str, kind: str, limit_chars: int = 1600, before: float | None = None,
+                  stage: str | None = None) -> str:
     """Real exchanges I typed myself (not the bot, not my HUMAN_MARKS meta-comments), most
-    recent first, from this chat; for chats other than hers, from my other chats too."""
-    files = [DATA_DIR / f"history_{key}.jsonl"]
-    girl_files = {f"history_{k}" for k, c in config.TARGETS.items() if c.get("kind") == "girl"}
+    recent first. Only for chats with her, and only from that same chat: the bot is not
+    meant to learn how I talk to my guy friends or in groups."""
     if kind != "girl":
-        files += [f for f in sorted(DATA_DIR.glob("history_*.jsonl")) + sorted(DATA_DIR.glob("archive/*/history_*.jsonl"))
-                  if f not in files and "filehelper" not in f.name and f.stem not in girl_files]
+        return ""
+    # Hand-distilled style notes + picked exchanges win over auto-extraction; one file per
+    # relationship stage when the way I talk to her changed with it.
+    candidates = ([DATA_DIR / f"style_{key}_{stage}.md"] if stage else []) + [DATA_DIR / f"style_{key}.md"]
+    for curated in candidates:
+        if curated.exists():
+            return curated.read_text(encoding="utf-8").strip()
+    path = DATA_DIR / f"history_{key}.jsonl"
+    if not path.exists():
+        return ""
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if before is not None:
+        rows = [r for r in rows if r["time"] < before]
     blocks, used = [], 0
-    for path in files:
-        if not path.exists():
-            continue
-        rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
-        if before is not None:
-            rows = [r for r in rows if r["time"] < before]
-        for ex in reversed(_exchanges(rows)):
-            if used + len(ex) > limit_chars:
-                break
-            blocks.append(ex)
-            used += len(ex)
+    for ex in reversed(_exchanges(rows)):
+        if used + len(ex) > limit_chars:
+            break
+        blocks.append(ex)
+        used += len(ex)
     return "\n---\n".join(blocks)
 
 
@@ -467,10 +529,93 @@ def ai_tell(lines: list[str]) -> str | None:
     return _first_match(AI_TELL, lines)
 
 
+def my_reply_shapes(key: str) -> list[tuple[int, int]]:
+    """(lines, chars) of each of my real turns in this chat: how long I actually reply.
+    Mostly a few characters, now and then a longer one (a long tail)."""
+    path = DATA_DIR / f"history_{key}.jsonl"
+    shapes, cur = [], []
+    try:
+        rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except FileNotFoundError:
+        rows = []
+    for r in rows + [{"sender": ""}]:
+        if r["sender"] == "我" and not r.get("auto") and not r["text"].startswith("[") \
+                and not MARKED_RE.match(r["text"]):
+            cur.append(reply_chars([r["text"]]))
+        elif cur:
+            shapes.append((len(cur), sum(cur)))
+            cur = []
+    return shapes
+
+
+def sample_shape(target: dict) -> tuple[int, int] | None:
+    """How long this reply may be: one of my real turns at random, else a long-tailed guess
+    around max_chars. None when the chat has no length limit."""
+    limit = target.get("max_chars")
+    if not limit:
+        return None
+    shapes = my_reply_shapes(target.get("key", "")) if target.get("key") else []
+    short = [x for x in shapes if x[1] <= limit]
+    long = [x for x in shapes if x[1] > limit]
+    if len(short) >= 10 and long:
+        n, chars = random.choice(short if random.random() < 0.8 else long)  # mostly short, a long tail
+    else:
+        chars = round(limit * 0.6 * random.lognormvariate(0, 0.7))
+        n = 1 if chars <= limit else 2
+    return min(n, MAX_LINES), max(4, min(chars, limit * 4))
+
+
+WECHAT_FACE = re.compile(r"\[[\u4e00-\u9fa5A-Za-z]{1,6}\]")
+
+
+# A reply that's only a nod or a compliment: nothing for her to answer.
+DEAD_END = re.compile(r"^(那?还?挺好的?|可以啊?|挺会挑的?|你?谦虚了|不错啊?|厉害啊?|牛啊?|行啊?|好的?|确实|是吧|哈哈+)[!！。~～]?$")
+
+
+DEAD_END_TAIL = re.compile(r"(挺好|不错|可以|还行|厉害|好看|舒服|香|确实|也行|暖和|爽|美)(的|啊|呀|了)?[!！。~～]?$")
+
+
+def dead_end(lines: list[str]) -> bool:
+    """Only nods ("那也挺好", "可以啊"): no question, nothing new for her to pick up."""
+    return bool(lines) and all(
+        (DEAD_END.match(l.strip()) or DEAD_END_TAIL.search(l.strip())) and not re.search(r"[吗呢嘛？?]", l)
+        for l in lines)
+
+
+def reply_chars(lines: list[str]) -> int:
+    return sum(len(re.sub(r"\s", "", l)) for l in lines)
+
+
+MEDIA_TEXT = re.compile(r"^\[(图片|视频|动画表情)\]$")
+
+
+def unseen_media(history: list[dict]) -> list[str]:
+    """Her unanswered messages, if a photo or video is among them (else [])."""
+    pending = []
+    for h in reversed(history):
+        if h["sender"] == "我":
+            break
+        pending.insert(0, h["text"])
+    return pending if any(MEDIA_TEXT.match(t.strip()) for t in pending) else []
+
+
+def repeats_me(lines: list[str], history: list[dict]) -> str | None:
+    """A draft line that is mostly one of my own recent lines again ("这都被你找到了" ->
+    "这家店都被你找到了"): reusing my own joke reads like a bot."""
+    import difflib
+    mine = [h["text"] for h in history[-12:] if h["sender"] == "我" and len(h["text"]) >= 4]
+    for line in lines:
+        for old in mine:
+            if len(line) >= 4 and difflib.SequenceMatcher(None, line, old).ratio() >= 0.7:
+                return line
+    return None
+
+
 def parroted(lines: list[str], history: list[dict]) -> str | None:
     """Return a draft line that just repeats something they said recently."""
-    theirs = {h["text"].strip() for h in history[-10:] if h["sender"] != "我"}
-    return next((line for line in lines if line.strip() in theirs), None)
+    bare = lambda t: re.sub(r"[\s?？!！。，,~～.…]+", "", t)  # "下班了？" still repeats "下班了"
+    theirs = {bare(h["text"]) for h in history[-10:] if h["sender"] != "我"}
+    return next((line for line in lines if bare(line) and bare(line) in theirs), None)
 
 
 def _first_match(pattern: re.Pattern, lines: list[str]) -> str | None:
@@ -481,23 +626,35 @@ def _first_match(pattern: re.Pattern, lines: list[str]) -> str | None:
     return None
 
 
-def girl_handoff(history: list[dict]) -> str | None:
-    """Return her first unanswered message that asks to meet or sounds upset."""
+def girl_trigger(history: list[dict], pattern: re.Pattern) -> str | None:
+    """Return her unanswered messages (joined) if, read together, they match pattern."""
+    waiting = []
     for row in reversed(history):
         if row["sender"] == "我":
-            return None
-        if GIRL_HANDOFF.search(row["text"].strip()):
-            return row["text"]
+            break
+        waiting.insert(0, row)
+    joined = " / ".join(r["text"].strip() for r in waiting)
+    if waiting and (pattern.search(joined.replace(" / ", "")) or any(pattern.search(r["text"].strip()) for r in waiting)):
+        return joined
     return None
 
 
+def asked_me(history: list[dict]) -> bool:
+    """Is the newest message theirs, and a direct question?"""
+    return bool(history) and history[-1]["sender"] != "我" and bool(DIRECT_QUESTION.search(history[-1]["text"]))
+
+
 def fact_question(history: list[dict]) -> str | None:
-    """Return their first unanswered message asking about my job, school, age, money…"""
+    """Return their unanswered messages if, read together, they ask about my job, school, age…
+    (a question is often split over two messages: "你跳槽定了没" / "去哪家公司")."""
+    waiting = []
     for row in reversed(history):
         if row["sender"] == "我":
-            return None
-        if FACT_ABOUT_ME.search(row["text"]):
-            return f"{row['sender']}：{row['text']}"
+            break
+        waiting.insert(0, row)
+    joined = "".join(r["text"] for r in waiting)
+    if waiting and FACT_ABOUT_ME.search(joined):
+        return f"{waiting[-1]['sender']}：" + " / ".join(r["text"] for r in waiting)
     return None
 
 
@@ -525,7 +682,10 @@ def parse_reply(raw: str) -> Decision:
         # (a bare number like "12:" isn't a name), and above all my own HUMAN_MARKS prefixes.
         line = re.sub(r"^(\d{1,2}:\d{2}\s*)?(?!\d+[：:])[\w一-鿿·\- ]{1,10}[：:]\s*(?=\S)",
                       "", line.strip())
-        line = strip_human_mark(line).strip("“”\"")
+        # Gap markers from the chat ("（隔了2 小时）") and stage directions ("（看到图）").
+        line = re.sub(r"^[（(][^）)]{0,12}[）)]\s*", "", strip_human_mark(line)).strip("“”\"")
+        if re.fullmatch(r"\[(语音|图片|视频|表情|链接|链接/文件|通话)\]", line):
+            continue  # placeholders copied from the log: the bot can't send voice or photos
         if line and not re.fullmatch(r"[-—\s]+", line):  # quote separators copied from the log
             lines.append(line)
     return Decision("reply", lines=lines[:MAX_LINES]) if lines else Decision("skip")

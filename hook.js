@@ -71,6 +71,9 @@
       window.__lcPush({
         id: String(m.MsgId), peer, isGroup, fromMe, type: m.MsgType, text, time: m.CreateTime,
         peerNick: toText(c.NickName), peerRemark: c.RemarkName || '', sender: toText(sender), mentionsMe,
+        // A forwarded chat record shows as "unsupported" on the web; its XML still has the lines.
+        raw: m.MsgType === 1 && !/暂不支持/.test(text) ? '' : JSON.stringify({MsgType: m.MsgType, AppMsgType: m.AppMsgType, SubMsgType: m.SubMsgType, Content: m.Content, OriContent: m.OriContent, FileName: m.FileName, Url: m.Url, MMAppMsgDesc: m.MMAppMsgDesc}),
+        myNick: toText(acc.getUserInfo().NickName),
       });
     }
 
@@ -124,6 +127,24 @@
       const ok = !!(sent && sent.BaseResponse && sent.BaseResponse.Ret === 0);
       if (ok && sent.MsgID) forwarded.add(String(sent.MsgID));
       return {ok, id: String((sent && sent.MsgID) || ''), step: 'send', detail: ok ? null : sent};
+    };
+
+    // A received picture as base64, so Python can have a vision model look at it.
+    window.__lcImage = async (msgId) => {
+      const url = confUrl(/webwxgetmsgimg/, '/cgi-bin/mmwebwx-bin/webwxgetmsgimg');
+      const skey = (acc.getSkey && acc.getSkey()) || '';
+      try {
+        const res = await fetch(`${url}?MsgID=${msgId}&skey=${encodeURIComponent(skey)}`, {credentials: 'include'});
+        if (!res.ok) return {ok: false, detail: `HTTP ${res.status}`};
+        const blob = await res.blob();
+        const data = await new Promise((done, fail) => {
+          const r = new FileReader();
+          r.onload = () => done(String(r.result).split(',')[1]);
+          r.onerror = fail;
+          r.readAsDataURL(blob);
+        });
+        return {ok: true, mime: blob.type || 'image/jpeg', data};
+      } catch (e) { return {ok: false, detail: String(e)}; }
     };
 
     // Look up a chat's UserName by 备注名 (friend) or group-name substring, for chats

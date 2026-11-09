@@ -1,7 +1,8 @@
 """Long-term memory per chat: facts distilled from the conversation, beyond the
 HISTORY_TURNS messages the model sees directly.
 
-data/memory_<key>.json = {"facts": [...], "covered_until": <time of last summarized message>}
+data/memory_<key>.json = {"pinned": [...], "facts": [...], "covered_until": <time of last summarized message>}
+"pinned" are the key facts I set by hand: always shown first, never rewritten by the summarizer.
 The file is plain JSON; edit the facts by hand whenever you like.
 """
 from __future__ import annotations
@@ -20,6 +21,9 @@ MAX_FACTS = 40
 
 EXTRACT = """\
 你在帮“我”整理一段微信聊天的长期记忆。
+
+置顶的关键信息（只读，不用复述，也别和它矛盾）：
+{pinned}
 
 已有记忆：
 {facts}
@@ -49,8 +53,18 @@ def path(key: str) -> Path:
 def load(key: str) -> dict:
     p = path(key)
     if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {"facts": [], "covered_until": 0}
+        mem = json.loads(p.read_text(encoding="utf-8"))
+        mem.setdefault("pinned", [])
+        mem.setdefault("corrections", [])
+        return mem
+    return {"pinned": [], "facts": [], "corrections": [], "covered_until": 0}
+
+
+def add_correction(key: str, text: str) -> None:
+    """I corrected a reply in 文件传输助手: keep it for every later reply in this chat."""
+    mem = load(key)
+    mem["corrections"] = (mem["corrections"] + [text])[-30:]
+    save(key, mem)
 
 
 def save(key: str, mem: dict) -> None:
@@ -86,18 +100,25 @@ def update(key: str, rows: list[dict]) -> int:
     batch = pending(key, rows)[:BATCH]
     if not batch:
         return 0
+    facts = extract(mem, batch)  # slow; pinned/corrections may be edited meanwhile
+    mem = load(key)
+    mem["facts"], mem["covered_until"] = facts, batch[-1]["time"]
+    save(key, mem)
+    return len(batch)
+
+
+def extract(mem: dict, rows: list[dict]) -> list[str]:
+    """Fold rows into mem["facts"] and return the new list (pure: nothing is saved)."""
     lines = "\n".join(
-        f"{time.strftime('%m-%d %H:%M', time.localtime(r['time']))} {r['sender']}：{r['text']}" for r in batch
+        f"{time.strftime('%m-%d %H:%M', time.localtime(r['time']))} {r['sender']}：{r['text']}" for r in rows
     )
-    facts = "\n".join(f"- {f}" for f in mem["facts"]) or "（暂无）"
     raw = llm.chat("你只输出 JSON。",
-                   EXTRACT.format(facts=facts, lines=lines, max_facts=MAX_FACTS),
-                   max_tokens=6000, reasoning_effort="medium")
+                   EXTRACT.format(pinned="\n".join(f"- {f}" for f in mem.get("pinned", [])) or "（暂无）",
+                                  facts="\n".join(f"- {f}" for f in mem["facts"]) or "（暂无）",
+                                  lines=lines, max_facts=MAX_FACTS),
+                   max_tokens=6000, reasoning_effort="medium", timeout=240)
     m = re.search(r"\[.*\]", raw, flags=re.S)
     new_facts = json.loads(m.group(0)) if m else None
     if not isinstance(new_facts, list):
         raise ValueError(f"记忆整理结果看不懂：{raw[:200]}")
-    mem["facts"] = [str(f).strip() for f in new_facts if str(f).strip()][:MAX_FACTS]
-    mem["covered_until"] = batch[-1]["time"]
-    save(key, mem)
-    return len(batch)
+    return [str(f).strip() for f in new_facts if str(f).strip()][:MAX_FACTS]
